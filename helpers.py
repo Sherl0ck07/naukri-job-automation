@@ -7,6 +7,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from score import resume_jd_similarity,embed
 import time
+from selenium.common.exceptions import TimeoutException
 
 from urllib.parse import urlparse, urlunparse
 
@@ -209,3 +210,43 @@ def add_similarity_score(job, resume_embed,jd_text,model_):
 
     return job
 
+
+def handle_login(driver, username, password, logger):
+    wait = WebDriverWait(driver, 12)
+
+    # check if already logged in (profile name visible)
+    try:
+        wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.info__heading[title]"))
+        )
+        logger.info("Already logged in.")
+        return
+    except TimeoutException:
+        logger.info("Not logged in. Logging in now...")
+
+    # username
+    username_input = wait.until(
+        EC.element_to_be_clickable((By.ID, "usernameField"))
+    )
+    username_input.clear()
+    username_input.send_keys(username)
+
+    # password
+    password_input = wait.until(
+        EC.element_to_be_clickable((By.ID, "passwordField"))
+    )
+    password_input.clear()
+    password_input.send_keys(password)
+
+    # login button
+    login_button = wait.until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Login')]"))
+    )
+    login_button.click()
+
+    # confirm login by waiting for profile element
+    wait.until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div.info__heading[title]"))
+    )
+
+    logger.info("Login successful.")

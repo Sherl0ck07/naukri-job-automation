@@ -32,7 +32,7 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 # ===== Local Modules =====
 from report import generate_html
 from score import extract_text_from_pdf, embed
-from helpers import scrape_jobs,add_similarity_score
+from helpers import scrape_jobs,add_similarity_score, handle_login
 
 # ===== Paths & Output Setup =====
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -111,110 +111,105 @@ service = Service(log_path='NUL')
 driver = webdriver.Chrome(service=service, options=options)
 
 # ===== Load Embedding Model =====
-import torch
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Using device: {device}")
+# import torch
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# logger.info(f"Using device: {device}")
 
 # Domain-specific model for resumes & job descriptions
-model_ = SentenceTransformer('TechWolf/JobBERT-v2')
+# model_ = SentenceTransformer('TechWolf/JobBERT-v2')
 
 # ===== Resume Embedding =====
-resume_text = extract_text_from_pdf(resume_path)
-resume_embed = embed(model_, resume_text)
-logger.info("Resume Extracted")
+# resume_text = extract_text_from_pdf(resume_path)
+# resume_embed = embed(model_, resume_text)
+# logger.info("Resume Extracted")
 
 # ===== Login to Naukri =====
 driver.get("https://www.naukri.com/nlogin/login")
 
-WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "usernameField"))).send_keys(username)
-WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "passwordField"))).send_keys(password)
-WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Login')]"))).click()
+wait = WebDriverWait(driver, 15)
 
-logger.info("Login successful!")
-
-# Allow page load
-time.sleep(5)
+handle_login(driver, username, password, logger)
 
 # XPath selectors for navigation
-job_links_xpath = "/html/body/div/div/main/div[1]/div[2]/div[2]/div/div/div/div[1]/h2/a"
+# job_links_xpath = "/html/body/div/div/main/div[1]/div[2]/div[2]/div/div/div/div[1]/h2/a"
 
-# ===== Job Scraping =====
-global data
-data = []
+# # ===== Job Scraping =====
+# global data
+# data = []
 
-with open("links.txt", "r") as f:
-    lk = ast.literal_eval(f.read())
-    logger.info(f"Links: {repr(lk)}")
+# with open("links.txt", "r") as f:
+#     lk = ast.literal_eval(f.read())
+#     logger.info(f"Links: {repr(lk)}")
 
-# Scrape jobs from provided links
-for l in lk:
-    driver.get(l[1])
-    scrape_jobs(data, driver, job_links_xpath,l[0])
+# # Scrape jobs from provided links
+# for l in lk:
+#     driver.get(l[1])
+#     scrape_jobs(data, driver, job_links_xpath,l[0])
 
-logger.info(f"Total scraped jobs: {len(data)}")
+# logger.info(f"Total scraped jobs: {len(data)}")
 
-# Drop duplicates based on "Job Title" and "Company Name"
-seen = set()
-unique_data = []
-for job in data:
-    key = (job.get("Job Title"), job.get("Company Name"))
-    if key not in seen:
-        seen.add(key)
-        unique_data.append(job)
+# # Drop duplicates based on "Job Title" and "Company Name"
+# seen = set()
+# unique_data = []
+# for job in data:
+#     key = (job.get("Job Title"), job.get("Company Name"))
+#     if key not in seen:
+#         seen.add(key)
+#         unique_data.append(job)
 
-data = unique_data
+# data = unique_data
 
-# ===== Resume-JD Similarity Scoring =====
-logger.info("Starting similarity scoring...")
+# # ===== Resume-JD Similarity Scoring =====
+# logger.info("Starting similarity scoring...")
 
-total_jobs = len(data)
-progress_bar = tqdm(total=total_jobs, desc="Similarity Scoring Progress", unit="job")
+# total_jobs = len(data)
+# progress_bar = tqdm(total=total_jobs, desc="Similarity Scoring Progress", unit="job")
 
-# Parallel similarity computation with ThreadPoolExecutor
-with ThreadPoolExecutor(max_workers=4) as executor:  # Limit workers to avoid GPU memory overload
-    futures = {
-        executor.submit(add_similarity_score, job, resume_embed, job.get("job_description", ""),model_): job
-        for job in data
-    }
+# # Parallel similarity computation with ThreadPoolExecutor
+# with ThreadPoolExecutor(max_workers=4) as executor:  # Limit workers to avoid GPU memory overload
+#     futures = {
+#         executor.submit(add_similarity_score, job, resume_embed, job.get("job_description", ""),model_): job
+#         for job in data
+#     }
 
-    for future in as_completed(futures):
-        try:
-            future.result()
-        except Exception as e:
-            logger.error(f"Error processing job: {e}")
-        finally:
-            progress_bar.update(1)
+#     for future in as_completed(futures):
+#         try:
+#             future.result()
+#         except Exception as e:
+#             logger.error(f"Error processing job: {e}")
+#         finally:
+#             progress_bar.update(1)
 
-logger.info("Similarity scoring completed.")
-
-
-
-data = sorted(
-    (job for job in data
-     if isinstance(job, dict)
-     and isinstance(job.get("score"), (float, int))
-     and job.get("score") is not None
-     and job.get("score") > 0.4),  # threshold
-    key=lambda x: x["score"],
-    reverse=True
-)
+# logger.info("Similarity scoring completed.")
 
 
 
-driver.quit()
-
-# ===== Save Data to JSON =====
-json_filename = f"job_data_{timestamp}.json"
-json_path = os.path.join(output_folder, json_filename)
-
-with open(json_path, "w", encoding="utf-8") as jf:
-    json.dump(data, jf, ensure_ascii=False, indent=2)
-
-logger.info(f"Job data JSON saved at {json_path}")
-
-
-base_dir = os.path.dirname(json_path)
-new_filename = os.path.join(base_dir, new_filename)
+# data = sorted(
+#     (job for job in data
+#      if isinstance(job, dict)
+#      and isinstance(job.get("score"), (float, int))
+#      and job.get("score") is not None
+#      and job.get("score") > 0.4),  # threshold
+#     key=lambda x: x["score"],
+#     reverse=True
+# )
 
 
-generate_html(data,new_filename)
+
+# driver.quit()
+
+# # ===== Save Data to JSON =====
+# json_filename = f"job_data_{timestamp}.json"
+# json_path = os.path.join(output_folder, json_filename)
+
+# with open(json_path, "w", encoding="utf-8") as jf:
+#     json.dump(data, jf, ensure_ascii=False, indent=2)
+
+# logger.info(f"Job data JSON saved at {json_path}")
+
+
+# base_dir = os.path.dirname(json_path)
+# new_filename = os.path.join(base_dir, new_filename)
+
+
+# generate_html(data,new_filename)

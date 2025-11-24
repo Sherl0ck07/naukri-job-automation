@@ -6,7 +6,7 @@ git/
 outputs/
 resume_transformers/
 resume-match/
-
+chrome_user_data_*/
 # Jupyter notebook junk
 *.ipynb_checkpoints/
 
