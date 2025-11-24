@@ -1,0 +1,21 @@
+# Folders to ignore
+__pycache__/
+close-applied-tabs/
+dynamic form handler/
+git/
+outputs/
+resume_transformers/
+resume-match/
+
+# Jupyter notebook junk
+*.ipynb_checkpoints/
+
+# Browser / automation cache
+chrome_user_data/
+
+# PDFs and reports you don't want in repo
+*.pdf
+
+# Misc local files
+*.log
+*.tmp
