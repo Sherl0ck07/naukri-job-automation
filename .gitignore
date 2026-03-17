@@ -19,3 +19,6 @@ chrome_user_data/
 # Misc local files
 *.log
 *.tmp
+C_mayuri/
+*.json
+vllm/

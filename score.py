@@ -1,30 +1,558 @@
+# ============= score.py =============
 
-# ============= score.py ============
-
-import numpy as np
-
-def embed(model_, text):
-    """
-    Embed the input text using the specified model.
-    """
-    return model_.encode(text, convert_to_tensor=True,show_progress_bar=False)
-
-def resume_jd_similarity(resume_emb: str, jd_emb: str) -> float:
-
-    # Compute cosine similarity
-    cosine_sim = np.dot(resume_emb, jd_emb) / (np.linalg.norm(resume_emb) * np.linalg.norm(jd_emb))
-    return round(float(cosine_sim), 4)
-
+import re
+import torch
 import PyPDF2
+from bs4 import BeautifulSoup
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Optional
 
-def extract_text_from_pdf(file_path: str) -> str:
-    text = ""
+
+# ─────────────────────────────────────────────────────────
+# Original helpers
+# ─────────────────────────────────────────────────────────
+
+def extract_text_from_pdf(path: str) -> str:
+    text = []
+    with open(path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text.append(page_text)
+    return "\n".join(text)
+
+
+def chunk_text(text: str, max_tokens=200):
+    sentences = text.split(".")
+    chunks, current = [], []
+    for s in sentences:
+        current.append(s)
+        if len(" ".join(current).split()) >= max_tokens:
+            chunks.append(" ".join(current))
+            current = []
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def embed(model, texts):
+    if isinstance(texts, str):
+        texts = [texts]
+    return model.encode(
+        texts,
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# Data Models
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class ResumeProfile:
+    skills: list
+    total_experience_years: float
+    sections: dict
+    education_level: str
+    location: str
+    preferred_work_mode: str
+    full_text: str
+    willing_to_relocate: bool = True
+
+    # ── Pre-encoded tensors (populated by precompute_resume_embeddings) ──
+    skills_emb: Optional[object] = None          # (n_skills, D)
+    section_embs: Optional[dict] = None          # {section_name: (1, D)}
+
+
+def parse_job_data(listing: dict, v3: dict, v4: dict) -> dict:
+    v3 = v3 or {}
+    v4 = v4 or {}
+    jd = v4.get("jobDetails", {})
+    ab = v4.get("ambitionBoxDetails", {})
+
+    skills_other     = [s["label"] for s in jd.get("keySkills", {}).get("other", [])]
+    skills_preferred = [s["label"] for s in jd.get("keySkills", {}).get("preferred", [])]
+    if not skills_other:
+        skills_other = listing.get("skills", [])
+
+    raw_html = jd.get("description", listing.get("job_description", ""))
+    jd_text  = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True) if raw_html else ""
+    if not jd_text:
+        jd_text = listing.get("job_description", "")
+
+    min_exp = jd.get("minimumExperience") or _parse_exp_range(listing.get("experience_range", ""))[0]
+    max_exp = jd.get("maximumExperience") or _parse_exp_range(listing.get("experience_range", ""))[1]
+
+    apply_count  = jd.get("applyCount") or _parse_applicants(listing.get("applicants_text", ""))
+    created_date = jd.get("createdDate")
+    age_days     = _compute_age_days(created_date) if created_date else _parse_age_days(listing.get("age", ""))
+
+    ab_salaries  = ab.get("salaries", {})
+    salary_avg   = float(ab_salaries.get("AverageCtc", 0) or 0)
+    salary_min   = float(ab_salaries.get("MinCtc", 0) or 0)
+    salary_max   = float(ab_salaries.get("MaxCtc", 0) or 0)
+
+    company_rating = float(v4.get("jdBrandingDetails", {}).get("overallRating", 0) or 0)
+    company_tags   = v4.get("jdBrandingDetails", {}).get("tags", [])
+
+    wfh_type  = str(jd.get("wfhType", ""))
+    work_mode = {"0": "office", "1": "remote", "2": "hybrid"}.get(wfh_type, listing.get("work_mode", "").lower())
+
+    # ── FIX 1: keyskillsCount is BINARY (0 or 1), not a continuous ratio ──
+    # keyskillsCount=0 means Naukri didn't index a match — treat as None (no signal)
+    # keyskillsCount=1 means Naukri found a match — treat as soft boost (0.7), not 1.0
+    raw_keyskills = v3.get("Keyskills", listing.get("keyskillsCount", None))
+    if raw_keyskills is None:
+        naukri_skill_ratio = None          # truly missing
+    else:
+        raw_val = float(raw_keyskills)
+        if raw_val == 0.0:
+            naukri_skill_ratio = None      # no-match flag, not a ratio — treat as missing
+        else:
+            naukri_skill_ratio = 0.7       # matched flag → soft positive boost
+
+    return {
+        "skills_required":          skills_other,
+        "skills_preferred":         skills_preferred,
+        "skill_mismatch":           v3.get("skillMismatch", listing.get("skillMismatch", "")),
+        "naukri_skill_ratio":       naukri_skill_ratio,
+        "min_experience":           min_exp,
+        "max_experience":           max_exp,
+        "jd_text":                  jd_text,
+        "role_title":               jd.get("title", listing.get("Job Title", "")),
+        "job_role":                 jd.get("jobRole", ""),
+        "role_category":            jd.get("roleCategory", ""),
+        "functional_area":          jd.get("functionalArea", ""),
+        "industry":                 jd.get("industry", ""),
+        "education_ug":             jd.get("education", {}).get("ug", []),
+        "education_pg":             jd.get("education", {}).get("pg", []),
+        "locations":                [loc["label"] for loc in jd.get("locations", [])] or [listing.get("location", "")],
+        "work_mode":                work_mode,
+        "apply_count":              apply_count,
+        "age_days":                 age_days,
+        "early_applicant":          v3.get("earlyApplicant",      listing.get("earlyApplicant",     False)),
+        "naukri_location_match":    v3.get("location",            listing.get("locationMatch",      False)),
+        "naukri_experience_match":  v3.get("workExperience",      listing.get("experienceMatch",    False)),
+        "naukri_industry_match":    v3.get("industry",            listing.get("industryMatch",      False)),
+        "naukri_education_match":   v3.get("education",           listing.get("educationMatch",     False)),
+        "naukri_functional_match":  v3.get("functionalArea",      listing.get("functionalAreaMatch",False)),
+        "company_rating":           company_rating,
+        "company_tags":             company_tags,
+        "salary_avg_lpa":           salary_avg,
+        "salary_min_lpa":           salary_min,
+        "salary_max_lpa":           salary_max,
+        # ── populated by precompute_job_embeddings ──
+        "_req_emb":                 None,
+        "_pref_emb":                None,
+        "_jd_emb":                  None,
+        "_role_emb":                None,
+        # store original binary flag for knockout logic
+        "_naukri_matched":          raw_keyskills is not None and float(raw_keyskills) > 0,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# BATCH PRE-ENCODING
+# ─────────────────────────────────────────────────────────
+
+def precompute_resume_embeddings(resume: ResumeProfile, model, device: str) -> None:
+    if resume.skills:
+        with torch.no_grad():
+            resume.skills_emb = model.encode(
+                resume.skills,
+                batch_size=512,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).to(device)
+
+    resume.section_embs = {}
+    section_texts = {
+        k: v for k, v in resume.sections.items()
+        if k != "_embeddings" and isinstance(v, str) and v.strip()
+    }
+    if section_texts:
+        names = list(section_texts.keys())
+        texts = list(section_texts.values())
+        with torch.no_grad():
+            all_embs = model.encode(
+                texts,
+                batch_size=512,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).to(device)
+        for i, name in enumerate(names):
+            resume.section_embs[name] = all_embs[i].unsqueeze(0)
+
+
+def precompute_job_embeddings(jobs: list, model, device: str, batch_size: int = 512) -> None:
+    # Pass 1: Required skills
+    req_texts = []
+    for job in jobs:
+        req_texts.extend(job["skills_required"])
+
+    if req_texts:
+        with torch.no_grad():
+            req_all = model.encode(
+                req_texts,
+                batch_size=batch_size,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).to(device)
+        start = 0
+        for job in jobs:
+            cnt = len(job["skills_required"])
+            if cnt > 0:
+                job["_req_emb"] = req_all[start:start + cnt]
+            start += cnt
+
+    # Pass 2: Preferred skills
+    pref_texts = []
+    for job in jobs:
+        pref_texts.extend(job["skills_preferred"])
+
+    if pref_texts:
+        with torch.no_grad():
+            pref_all = model.encode(
+                pref_texts,
+                batch_size=batch_size,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).to(device)
+        start = 0
+        for job in jobs:
+            cnt = len(job["skills_preferred"])
+            if cnt > 0:
+                job["_pref_emb"] = pref_all[start:start + cnt]
+            start += cnt
+
+    # Pass 3: JD texts
+    jd_texts = [(job.get("jd_text") or "")[:2000] or "no description" for job in jobs]
+    with torch.no_grad():
+        jd_all = model.encode(
+            jd_texts,
+            batch_size=batch_size,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).to(device)
+    for j_idx, job in enumerate(jobs):
+        job["_jd_emb"] = jd_all[j_idx].unsqueeze(0)
+
+    # Pass 4: Role context
+    role_texts = [
+        f"{job.get('role_category','')} {job.get('functional_area','')} {job.get('job_role','')}".strip()
+        or "software engineer"
+        for job in jobs
+    ]
+    with torch.no_grad():
+        role_all = model.encode(
+            role_texts,
+            batch_size=batch_size,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).to(device)
+    for j_idx, job in enumerate(jobs):
+        job["_role_emb"] = role_all[j_idx].unsqueeze(0)
+
+
+# ─────────────────────────────────────────────────────────
+# Scoring Engine
+# ─────────────────────────────────────────────────────────
+
+class SmartScorer:
+
+    WEIGHTS = {
+        "skill_match":          0.32,
+        "semantic_similarity":  0.15,
+        "naukri_v3_signals":    0.22,
+        "experience_fit":       0.10,
+        "location_mode":        0.08,
+        "competition_quality":  0.13,
+    }
+
+    SECTION_WEIGHTS = {
+        "experience":     1.6,
+        "projects":       1.2,
+        "skills":         1.0,
+        "summary":        0.9,
+        "certifications": 0.8,
+        "education":      0.7,
+    }
+
+    # ── FIX 2: raised threshold to reduce java/javascript false positives ──
+    SKILL_THRESHOLD = 0.82   # was 0.78
+
+    def score(self, resume: ResumeProfile, job: dict, model=None) -> dict:
+        signals = {
+            "skill_match":          self._skill_match(resume, job),
+            "semantic_similarity":  self._semantic(resume, job),
+            "naukri_v3_signals":    self._naukri_v3(job),
+            "experience_fit":       self._experience(resume, job),
+            "location_mode":        self._location(resume, job),
+            "competition_quality":  self._competition(job),
+        }
+
+        raw = sum(self.WEIGHTS[k] * v for k, v in signals.items())
+        raw = self._knockouts(raw, signals, resume, job)
+
+        return {
+            "total_score":    round(raw * 100, 1),
+            "grade":          self._grade(raw),
+            "breakdown":      {k: round(v * 100, 1) for k, v in signals.items()},
+            "missing_skills": self._missing_skills(job),
+            "salary_insight": self._salary_insight(job),
+            "flags":          self._flags(signals, resume, job),
+            "apply_priority": self._priority(raw, job),
+        }
+
+    def _skill_match(self, resume: ResumeProfile, job: dict) -> float:
+        # ── FIX 2: embeddings ALWAYS run — naukri_ratio is a modifier only ──
+        req_emb  = job.get("_req_emb")
+        pref_emb = job.get("_pref_emb")
+
+        # If no embeddings available at all, fall back to naukri signal
+        if req_emb is None or resume.skills_emb is None:
+            naukri_ratio = job["naukri_skill_ratio"]
+            return naukri_ratio if naukri_ratio is not None else 0.3
+
+        sim_matrix  = torch.nn.functional.cosine_similarity(
+            req_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1
+        )
+        req_matched = (sim_matrix.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
+
+        pref_score = 0.0
+        if pref_emb is not None:
+            pref_matrix = torch.nn.functional.cosine_similarity(
+                pref_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1
+            )
+            pref_score = (pref_matrix.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
+
+        embedding_score = 0.8 * req_matched + 0.2 * pref_score
+
+        # naukri_ratio: None = no signal (0 or missing), 0.7 = soft match confirmed
+        # Embedding leads, naukri_ratio is a modifier
+        naukri_ratio = job["naukri_skill_ratio"]
+        if naukri_ratio is None:
+            combined = embedding_score                          # embedding only
+        else:
+            combined = 0.6 * embedding_score + 0.4 * naukri_ratio   # embedding leads
+
+        mismatch_skills  = [s.strip() for s in job["skill_mismatch"].split(",") if s.strip()]
+        mismatch_penalty = min(0.25, len(mismatch_skills) * 0.05)
+
+        return max(0.0, combined - mismatch_penalty)
+
+    def _semantic(self, resume: ResumeProfile, job: dict) -> float:
+        jd_emb   = job.get("_jd_emb")
+        role_emb = job.get("_role_emb")
+
+        if jd_emb is None or resume.section_embs is None:
+            return 0.5
+
+        weighted_sims, total_w = [], 0.0
+
+        for section, sec_emb in resume.section_embs.items():
+            sim_jd   = torch.nn.functional.cosine_similarity(sec_emb, jd_emb).item()
+            sim_role = torch.nn.functional.cosine_similarity(sec_emb, role_emb).item() \
+                       if role_emb is not None else sim_jd
+            sim = 0.75 * sim_jd + 0.25 * sim_role
+            w   = self.SECTION_WEIGHTS.get(section, 1.0)
+            weighted_sims.append(sim * w)
+            total_w += w
+
+        if not weighted_sims:
+            return 0.0
+
+        raw_sim  = sum(weighted_sims) / total_w
+        low, high = 0.30, 0.65
+        rescaled = (raw_sim - low) / (high - low)
+        return max(0.0, min(1.0, rescaled))
+
+    def _naukri_v3(self, job: dict) -> float:
+        # ── FIX 3: naukri_v3 uses original binary match flag, not the remapped ratio ──
+        # keyskill component: 0.7 if matched, 0 if not — no longer 0.5 neutral for no-match
+        naukri_matched = job.get("_naukri_matched", False)
+        keyskill_score = 0.7 if naukri_matched else 0.0
+
+        booleans = [
+            (job["naukri_experience_match"],  0.30),
+            (job["naukri_industry_match"],    0.20),
+            (job["naukri_location_match"],    0.15),
+            (job["naukri_functional_match"],  0.15),
+            (job["naukri_education_match"],   0.10),
+        ]
+        bool_score = sum(w for flag, w in booleans if flag) / 0.90
+
+        # Weight keyskill more when matched, booleans more when not
+        if naukri_matched:
+            return 0.50 * keyskill_score + 0.50 * bool_score
+        else:
+            # No keyword match — reduce naukri_v3 weight on booleans alone
+            return 0.30 * bool_score
+
+    def _experience(self, resume: ResumeProfile, job: dict) -> float:
+        min_exp = job.get("min_experience")
+        max_exp = job.get("max_experience")
+        years   = resume.total_experience_years
+
+        if job["naukri_experience_match"] and min_exp and max_exp and min_exp <= years <= max_exp:
+            return 1.0
+        if min_exp is None:
+            return 0.5
+        if years < min_exp:
+            return max(0.0, 1.0 - ((min_exp - years) / min_exp) * 0.85)
+        elif max_exp and years > max_exp:
+            return max(0.65, 1.0 - ((years - max_exp) / max_exp) * 0.12)
+        return 1.0
+
+    def _location(self, resume: ResumeProfile, job: dict) -> float:
+        if getattr(resume, 'willing_to_relocate', True):
+            location_score = 0.5
+        elif job["naukri_location_match"]:
+            location_score = 1.0
+        else:
+            resume_loc = resume.location.lower()
+            matched    = any(
+                resume_loc in loc.lower() or loc.lower() in resume_loc
+                for loc in job.get("locations", [])
+            )
+            location_score = 1.0 if matched else (0.8 if job.get("work_mode") == "remote" else 0.0)
+
+        pref    = resume.preferred_work_mode.lower()
+        jd_mode = job.get("work_mode", "").lower()
+        if pref == jd_mode:               mode_score = 1.0
+        elif "hybrid" in (pref, jd_mode): mode_score = 0.6
+        else:                             mode_score = 0.2
+
+        return min(1.0, 0.5 * location_score + 0.5 * mode_score)
+
+    def _competition(self, job: dict) -> float:
+        age_days = job.get("age_days", 7)
+        if age_days <= 1:     freshness = 1.0
+        elif age_days <= 3:   freshness = 0.85
+        elif age_days <= 7:   freshness = 0.65
+        elif age_days <= 14:  freshness = 0.40
+        elif age_days <= 30:  freshness = 0.20
+        else:                 freshness = 0.05
+
+        count = job.get("apply_count", 50)
+        if count < 20:      competition = 1.0
+        elif count < 50:    competition = 0.80
+        elif count < 100:   competition = 0.55
+        elif count < 200:   competition = 0.30
+        elif count < 500:   competition = 0.15
+        else:               competition = 0.05
+
+        rating  = job.get("company_rating", 0)
+        quality = (rating / 5.0) if rating else 0.5
+        tags    = [t.lower() for t in job.get("company_tags", [])]
+        if "foreign mnc" in tags or "saas" in tags:
+            quality = min(1.0, quality + 0.1)
+
+        early_bonus = 0.1 if job.get("early_applicant") else 0.0
+        return min(1.0, 0.35 * freshness + 0.35 * competition + 0.25 * quality + early_bonus)
+
+    def _knockouts(self, score: float, signals: dict, resume: ResumeProfile, job: dict) -> float:
+        # ── FIX 4: remove naukri_ratio==0.0 knockout (was firing on 700 jobs) ──
+        # Only penalise DOUBLE-CONFIRMED misses: embedding low AND skill_match low
+        # naukri binary flag alone is not reliable enough to trigger a knockout
+        if signals["skill_match"] < 0.15 and signals["semantic_similarity"] < 0.20:
+            score *= 0.45   # both embedding signals say no match → heavy penalty
+
+        # Experience gap knockout — unchanged
+        min_exp = job.get("min_experience") or 0
+        if min_exp and resume.total_experience_years < (min_exp - 3):
+            score *= 0.65
+
+        return score
+
+    # ── Output helpers (unchanged) ────────────────────────────────────────
+
+    def _missing_skills(self, job: dict) -> list:
+        raw = job.get("skill_mismatch", "")
+        return [s.strip() for s in raw.split(",") if s.strip()]
+
+    def _salary_insight(self, job: dict) -> Optional[str]:
+        avg = job.get("salary_avg_lpa", 0)
+        mn  = job.get("salary_min_lpa", 0)
+        mx  = job.get("salary_max_lpa", 0)
+        if avg:
+            return f"₹{mn}L - ₹{mx}L (avg ₹{avg}L) — AmbitionBox data"
+        return None
+
+    def _grade(self, score: float) -> str:
+        if score >= 0.80: return "A — Strong Match"
+        if score >= 0.65: return "B — Good Match"
+        if score >= 0.50: return "C — Moderate Match"
+        if score >= 0.35: return "D — Weak Match"
+        return "F — Poor Match"
+
+    def _priority(self, score: float, job: dict) -> str:
+        age_days = job.get("age_days", 99)
+        count    = job.get("apply_count", 999)
+        if score >= 0.70 and age_days <= 3 and count < 100:
+            return "🔥 Apply Immediately"
+        if score >= 0.60 and age_days <= 7:
+            return "✅ Apply Today"
+        if score >= 0.50:
+            return "📋 Apply This Week"
+        return "⏭️ Skip / Low Priority"
+
+    def _flags(self, signals: dict, resume: ResumeProfile, job: dict) -> list:
+        flags   = []
+        missing = self._missing_skills(job)
+        if missing:
+            flags.append(f"Missing skills: {', '.join(missing)}")
+        if signals["experience_fit"] < 0.5:
+            flags.append(f"Experience gap: need {job.get('min_experience')}-{job.get('max_experience')}y, you have {resume.total_experience_years}y")
+        if job.get("apply_count", 0) > 200:
+            flags.append(f"High competition: {job['apply_count']} applicants already")
+        if job.get("age_days", 0) > 14:
+            flags.append(f"Stale posting: {job['age_days']} days old")
+        sal = self._salary_insight(job)
+        if sal:
+            flags.append(f"Salary insight: {sal}")
+        if "foreign mnc" in [t.lower() for t in job.get("company_tags", [])]:
+            flags.append("Foreign MNC — global exposure")
+        return flags
+
+
+# ─────────────────────────────────────────────────────────
+# Utility functions
+# ─────────────────────────────────────────────────────────
+
+def _parse_exp_range(text: str):
+    nums = re.findall(r'\d+(?:\.\d+)?', str(text))
+    if len(nums) >= 2: return float(nums[0]), float(nums[1])
+    if len(nums) == 1: return float(nums[0]), float(nums[0]) + 2
+    return None, None
+
+def _parse_applicants(text: str) -> int:
+    nums = re.findall(r'\d+', str(text))
+    return int(nums[0]) if nums else 50
+
+def _compute_age_days(date_str: str) -> int:
     try:
-        with open(file_path, "rb") as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                text += page.extract_text() or ""  # some pages may return None
-        return text.strip()
-    except Exception as e:
-        print(f"Error extracting text from {file_path}: {e}")
-        return ""
+        posted = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - posted).days
+    except:
+        return 7
+
+def _parse_age_days(age_str: str) -> int:
+    age_str = (age_str or "").lower()
+    nums = re.findall(r'\d+', age_str)
+    n = int(nums[0]) if nums else 1
+    if "hour"  in age_str: return 0
+    if "day"   in age_str: return n
+    if "week"  in age_str: return n * 7
+    if "month" in age_str: return n * 30
+    return 7
