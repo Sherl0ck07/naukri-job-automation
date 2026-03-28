@@ -1,0 +1,40 @@
+oneClickShell
+├── core
+│   ├── auto_apply
+│   │   ├── __init__.py
+│   │   └── auto_apply_new.py
+│   ├── cache
+│   ├── helpers.py
+│   ├── job_cache.py
+│   ├── main.py
+│   ├── report.py
+│   ├── resume_parser.py
+│   └── score.py
+├── profiles
+│   ├── mayuri
+│   │   ├── cache
+│   │   │   └── job_cache_job_cache.json.json
+│   │   ├── applied_jobs.json
+│   │   ├── config.json
+│   │   ├── failed_applications.json
+│   │   ├── links.txt
+│   │   ├── master_qa.json
+│   │   ├── qa_cache.json
+│   │   ├── resume.pdf
+│   │   └── resume_profile_mayuri.json
+│   └── pandurang
+│       ├── cache
+│       ├── applied_jobs.json
+│       ├── config_A.json
+│       ├── config_B.json
+│       ├── failed_applications.json
+│       ├── links.txt
+│       ├── master_qa.json
+│       ├── qa_cache.json
+│       └── resume_profile_pandurang.json
+├── .gitignore
+├── migrate.py
+├── MIGRATION_GUIDE.md
+├── README.md
+├── requirements.txt
+├── run_my_script.bat

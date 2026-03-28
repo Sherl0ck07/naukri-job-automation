@@ -1,7 +1,0 @@
-<div class="dob__input-container">
-                        <span id="dobInput__8mcpiszf8DobInputBox">
-                            <input type="number" name="day" id="dobInputDay__8mcpiszf8DobInputBox" placeholder="DD" maxlength="2" min="1" max="31" class="dob__input day" fdprocessedid="h2q6w3"><span class="slash" id="slash_1">/</span>
-                            <input type="number" name="month" id="dobInputMonth__8mcpiszf8DobInputBox" placeholder="MM" maxlength="2" min="1" max="12" class="dob__input month" fdprocessedid="wwxga3"><span class="slash" id="slash_2">/</span>
-                            <input type="number" name="year" id="dobInputYear__8mcpiszf8DobInputBox" placeholder="YYYY" maxlength="4" class="dob__input year" fdprocessedid="vd7hv9">
-                        </span>
-                    </div>

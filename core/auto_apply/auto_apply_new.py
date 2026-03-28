@@ -42,31 +42,61 @@ import PyPDF2
 # CONFIGURATION
 # ==========================================
 
+# ── Dynamic base path resolution ─────────────────────────────────────────
+# auto_apply_new.py lives at  oneClickShell/core/auto_apply/
+# Project root is two levels up
+_HERE    = os.path.dirname(os.path.abspath(__file__))   # core/auto_apply/
+BASE_DIR = os.path.dirname(os.path.dirname(_HERE))       # oneClickShell/
+
+def _p(profile: str, filename: str) -> str:
+    """Resolve a path inside profiles/<profile>/."""
+    return os.path.join(BASE_DIR, "profiles", profile, filename)
+
 CONFIGS = {
     "A_NEW": {
-        "APPLIED_LOG": r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\applied_jobs.json",
-        "QA_MASTER":   r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\master_qa.json",
-        "QA_CACHE":    r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\qa_cache.json",
-        "CONFIG":      r"C:\Users\imjad\Desktop\case study\st\oneClickShell\config.json",
+        "APPLIED_LOG": _p("pandurang", "applied_jobs.json"),
+        "QA_MASTER":   _p("pandurang", "master_qa.json"),
+        "QA_CACHE":    _p("pandurang", "qa_cache.json"),
+        "CONFIG":      _p("pandurang", "config_A.json"),
+        "FAILED_LOG":  _p("pandurang", "failed_applications.json"),
     },
     "B_OLD": {
-        "APPLIED_LOG": r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\applied_jobs.json",
-        "QA_MASTER":   r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\master_qa.json",
-        "QA_CACHE":    r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\qa_cache.json",
-        "CONFIG":      r"C:\Users\imjad\Desktop\case study\st\oneClickShell\config-old.json",
+        "APPLIED_LOG": _p("pandurang", "applied_jobs.json"),   # shared with A
+        "QA_MASTER":   _p("pandurang", "master_qa.json"),      # shared with A
+        "QA_CACHE":    _p("pandurang", "qa_cache.json"),       # shared with A
+        "CONFIG":      _p("pandurang", "config_B.json"),
+        "FAILED_LOG":  _p("pandurang", "failed_applications.json"),
     },
     "C_MAYURI": {
-        "APPLIED_LOG": r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\C_mayuri\applied_jobs.json",
-        "QA_MASTER":   r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\C_mayuri\master_qa.json",
-        "QA_CACHE":    r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\C_mayuri\qa_cache.json",
-        "CONFIG":      r"C:\Users\imjad\Desktop\case study\st\oneClickShell\config - Mayuri.json",
+        "APPLIED_LOG": _p("mayuri", "applied_jobs.json"),
+        "QA_MASTER":   _p("mayuri", "master_qa.json"),
+        "QA_CACHE":    _p("mayuri", "qa_cache.json"),
+        "CONFIG":      _p("mayuri", "config.json"),
+        "FAILED_LOG":  _p("mayuri", "failed_applications.json"),
     },
 }
 
-ACTIVE_PROFILE  = "C_MAYURI"   # ← change to switch profile
-PROFILE         = CONFIGS[ACTIVE_PROFILE]
-FAILED_LOG      = r"C:\Users\imjad\Desktop\case study\st\oneClickShell\AutoApply\failed_applications.json"
-URLS_JSON       = r"C:\Users\imjad\Desktop\case study\st\oneClickShell\outputs\run_20260312_221951\job_data_20260312_221951.json"
+ACTIVE_PROFILE = "C_MAYURI"   # ← change to switch profile
+PROFILE        = CONFIGS[ACTIVE_PROFILE]
+FAILED_LOG     = PROFILE["FAILED_LOG"]   # ← now derived from active profile
+URLS_JSON      = os.path.join(BASE_DIR, "outputs", "latest_job_data.json")  # update as needed
+
+
+def set_active_profile(profile_key: str):
+    """
+    Switch the active profile at runtime. Call this from main.py
+    right after importing, before using AppliedCache or FailedLogger.
+
+    Usage:
+        from auto_apply.auto_apply_new import set_active_profile
+        set_active_profile("B_OLD")   # or "A_NEW" / "C_MAYURI"
+    """
+    global ACTIVE_PROFILE, PROFILE, FAILED_LOG
+    if profile_key not in CONFIGS:
+        raise ValueError(f"Unknown profile key '{profile_key}'. Valid: {list(CONFIGS.keys())}")
+    ACTIVE_PROFILE = profile_key
+    PROFILE        = CONFIGS[ACTIVE_PROFILE]
+    FAILED_LOG     = PROFILE["FAILED_LOG"]
 OLLAMA_MODEL    = "qwen2.5:7b"
 MAX_STEPS       = 30
 POLL_RETRIES    = 10
@@ -195,10 +225,18 @@ _TOPIC_PATTERNS = [
     (r"(date\s*of\s*birth|\bdob\b)",                            "dob"),
     (r"\bpassport\b",                                           "passport"),
     (r"\blinkedin\b",                                           "linkedin"),
+    # Disability — must come BEFORE education_degree so "disability percentage"
+    # doesn't fall through to the education patterns
+    (r"kind\s*(of\s*)?disability",                              "disability_type"),
+    (r"disability\s*(percent|percentage)",                      "disability_percentage"),
+    (r"\bdisabilit",                                            "disability"),
     (r"(10th|ssc|matriculat)",                                  "education_10th"),
     (r"(12th|hsc|intermediate)",                                "education_12th"),
-    (r"(graduation|degree|b\.?e\.?|b\.?tech)",                  "education_degree"),
-    (r"\bpercentage\b",                                         "education"),
+    # b.e. requires both dots to avoid matching the word "be"
+    (r"(graduation|degree|b\.e\.|b\.?tech)",                    "education_degree"),
+    # percentage only fires for education context — disability is already caught above
+    (r"(10th|12th|graduation|marks|cgpa|gpa).{0,20}percentage"
+     r"|percentage.{0,20}(10th|12th|marks|score|cgpa|gpa)",    "education"),
     # Role / Motivation
     (r"reason\s*for\s*(change|leav|switch)",                    "reason_for_change"),
     (r"why\s*(this\s*company|your\s*company|\bus\b)",            "why_company"),
@@ -650,26 +688,47 @@ def resolve(q_text: str, input_type: str, cache: dict, qa: list,
             options=None, is_multiselect=False):
 
     topic = normalize_topic(q_text)
+    _is_exp_text = (input_type == "text" and topic.startswith("exp::"))
 
     # 1. Exact cache hit
     cached = cache_get(cache, q_text, input_type)
     if cached is not None:
-        logging.info(f"  [cache-exact] {topic} → {str(cached)[:40]}")
-        return cached
+        # For text exp:: fields, reject non-numeric cached values (e.g. "Yes"
+        # from a radio answer that leaked into the cache via a previous bug).
+        if _is_exp_text and not str(cached).replace('.', '').isdigit():
+            logging.warning(
+                f"  [cache-skip] {topic} cached value '{cached}' is non-numeric "
+                f"for text field — skipping to QA/Ollama"
+            )
+        else:
+            logging.info(f"  [cache-exact] {topic} → {str(cached)[:40]}")
+            return cached
 
     # 2. Cross-type cache hit (type-aware, compatibility-guarded)
     cross = cache_get_by_topic(cache, topic, input_type)
     if cross is not None:
-        cache_set(cache, q_text, input_type, cross, PROFILE["QA_CACHE"])
-        logging.info(f"  [cache-cross] {topic} → {str(cross)[:40]}")
-        return cross
+        if _is_exp_text and not str(cross).replace('.', '').isdigit():
+            logging.warning(
+                f"  [cache-skip] {topic} cross value '{cross}' is non-numeric "
+                f"for text field — skipping"
+            )
+        else:
+            cache_set(cache, q_text, input_type, cross, PROFILE["QA_CACHE"])
+            logging.info(f"  [cache-cross] {topic} → {str(cross)[:40]}")
+            return cross
 
     # 3. QA master match
     stored = qa_lookup(q_text, qa)
     if stored is not None:
-        cache_set(cache, q_text, input_type, stored, PROFILE["QA_CACHE"])
-        logging.info(f"  [qa-master] {topic} → {str(stored)[:40]}")
-        return stored
+        if _is_exp_text and not str(stored).replace('.', '').isdigit():
+            logging.warning(
+                f"  [qa-skip] {topic} QA value '{stored}' is non-numeric "
+                f"for text field — falling through to Ollama"
+            )
+        else:
+            cache_set(cache, q_text, input_type, stored, PROFILE["QA_CACHE"])
+            logging.info(f"  [qa-master] {topic} → {str(stored)[:40]}")
+            return stored
 
     # 4. Ollama
     prompt = build_prompt(q_text, cache, qa, skill_summary, resume, options, is_multiselect)
@@ -695,6 +754,41 @@ def resolve(q_text: str, input_type: str, cache: dict, qa: list,
 # and every fallback is logged as a warning so you can audit bad answers.
 # ==========================================
 
+def _numeric_range_match(answer: str, options: list):
+    """
+    Match a plain number to a range-style option.
+    Handles: 'Less than N', 'N to M Years', 'More than N Years', 'N+'.
+    Returns the matching option string, or None if no match found.
+    """
+    try:
+        val = float(re.sub(r'[^\d.]', '', answer.strip()))
+    except (ValueError, TypeError):
+        return None
+    if not answer.strip().replace('.', '').isdigit():
+        return None   # not a plain number
+
+    _range     = re.compile(r'(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)', re.I)
+    _less_than = re.compile(r'less\s*than\s*(\d+(?:\.\d+)?)', re.I)
+    _more_than = re.compile(r'(?:more|greater|above)\s*than\s*(\d+(?:\.\d+)?)', re.I)
+    _plus      = re.compile(r'(\d+(?:\.\d+)?)\s*\+', re.I)
+
+    for opt in options:
+        m = _range.search(opt)
+        if m and float(m.group(1)) <= val <= float(m.group(2)):
+            return opt
+        m = _less_than.search(opt)
+        if m and val < float(m.group(1)):
+            return opt
+        m = _more_than.search(opt)
+        if m and val > float(m.group(1)):
+            return opt
+        m = _plus.search(opt)
+        if m and val >= float(m.group(1)):
+            return opt  # e.g. "3+" matches 4
+
+    return None
+
+
 def fuzzy_match(answer, options: list) -> str:
     if not isinstance(answer, str):
         answer = str(answer)
@@ -702,6 +796,11 @@ def fuzzy_match(answer, options: list) -> str:
     # Exact match
     if answer in options:
         return answer
+
+    # Numeric range match — handles "28" → "25 to 32 Years", "4" → "3+", etc.
+    range_hit = _numeric_range_match(answer, options)
+    if range_hit:
+        return range_hit
 
     lowered = [o.lower() for o in options]
 

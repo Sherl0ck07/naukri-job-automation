@@ -4,7 +4,7 @@ SETLOCAL
 REM ===== Configuration =====
 SET VENV_DIR=resume_transformers
 SET REQUIREMENTS=requirements.txt
-SET SCRIPT=main.py
+SET SCRIPT=core\main.py
 SET PYTHON_EXE=C:\Users\imjad\AppData\Local\Programs\Python\Python311\python.exe
 
 REM ===== Check if system Python exists =====

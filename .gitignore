@@ -22,3 +22,4 @@ chrome_user_data/
 C_mayuri/
 *.json
 vllm/
+profiles/

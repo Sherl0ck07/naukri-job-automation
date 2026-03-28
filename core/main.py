@@ -28,7 +28,8 @@ from selenium.webdriver.chrome.service import Service
 
 from report import generate_html
 from score import extract_text_from_pdf, embed, chunk_text, SmartScorer, parse_job_data, ResumeProfile
-from helpers import generate_pagination_urls, collect_links_from_page, extract_job_details, handle_login
+from helpers import generate_pagination_urls, collect_links_from_page, extract_job_details, handle_login, extract_job_id
+from job_cache import JobScrapeCache  # ← CACHE
 from resume_parser import load_or_create_resume_profile
 
 import torch
@@ -37,29 +38,47 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda}")
 print(f"cuDNN version: {torch.backends.cudnn.version()}")
 
-base_dir = os.path.dirname(os.path.abspath(__file__))
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))   # oneClickShell/core/
+base_dir  = os.path.dirname(_CORE_DIR)                    # oneClickShell/
+
+timestamp     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 output_folder = os.path.join(base_dir, "outputs", f"run_{timestamp}")
 os.makedirs(output_folder, exist_ok=True)
 
-run = "B"
+run        = "A"
 AUTO_APPLY = True
 
+# ── Per-run profile resolution ────────────────────────────────────────────
 if run == "A":
-    config_path = os.path.join(base_dir, "config-old.json")
-    new_filename = f"job_crawl_summary_A_{timestamp}.html"
-    log_file = os.path.join(output_folder, f"output_A_{timestamp}.log")
+    profile_dir         = os.path.join(base_dir, "profiles", "pandurang")
+    cache_file          = "job_cache_A.json"
+    config_path         = os.path.join(profile_dir, "config_A.json")
+    links_path          = os.path.join(profile_dir, "links.txt")
+    resume_profile_path = os.path.join(profile_dir, "resume_profile_pandurang.json")
+    new_filename        = f"job_crawl_summary_A_{timestamp}.html"
+    log_file            = os.path.join(output_folder, f"output_A_{timestamp}.log")
 elif run == "B":
-    config_path = os.path.join(base_dir, "config.json")
-    new_filename = f"job_crawl_summary_B_{timestamp}.html"
-    log_file = os.path.join(output_folder, f"output_B_{timestamp}.log")
-else:
-    config_path = os.path.join(base_dir, "config - Mayuri.json")
-    new_filename = f"job_crawl_summary_M_{timestamp}.html"
-    log_file = os.path.join(output_folder, f"output_M_{timestamp}.log")
+    profile_dir         = os.path.join(base_dir, "profiles", "pandurang")
+    cache_file          = "job_cache_B.json"
+    config_path         = os.path.join(profile_dir, "config_B.json")
+    links_path          = os.path.join(profile_dir, "links.txt")
+    resume_profile_path = os.path.join(profile_dir, "resume_profile_pandurang.json")
+    new_filename        = f"job_crawl_summary_B_{timestamp}.html"
+    log_file            = os.path.join(output_folder, f"output_B_{timestamp}.log")
+else:  
+    profile_dir         = os.path.join(base_dir, "profiles", "mayuri")
+    cache_file          = "job_cache.json"
+    config_path         = os.path.join(profile_dir, "config.json")
+    links_path          = os.path.join(profile_dir, "links.txt")
+    resume_profile_path = os.path.join(profile_dir, "resume_profile_mayuri.json")
+    new_filename        = f"job_crawl_summary_M_{timestamp}.html"
+    log_file            = os.path.join(output_folder, f"output_M_{timestamp}.log")
 
 with open(config_path, "r") as f:
     config = json.load(f)
+
+# ← CACHE: init per-profile cache (prunes expired entries on startup)
+job_cache = JobScrapeCache(profile_dir, cache_file)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -209,7 +228,7 @@ if len(drivers) == 0:
 
 job_links_xpath = "/html/body/div/div/main/div[1]/div[2]/div[2]/div/div/div/div[1]/h2/a"
 
-with open("links.txt", "r") as f:
+with open(links_path, "r") as f:
     lk = ast.literal_eval(f.read())
     logger.info(f"Links: {repr(lk)}")
 
@@ -251,11 +270,25 @@ with tqdm(total=total_pages, desc="Scraping Pages", unit="page") as pbar:
 
 logger.info(f"Total unique job links collected: {len(all_job_links)}")
 
+# ← CACHE: split links into already-cached vs needs-scraping
+cached_jobs: list = []
+urls_to_scrape: list = []
+
+for link in all_job_links:
+    jid = extract_job_id(link)
+    if jid and job_cache.is_cached(jid):
+        cached_jobs.append(job_cache.get(jid))
+    else:
+        urls_to_scrape.append(link)
+
+logger.info(f"Cache hit:  {len(cached_jobs)} jobs loaded from cache")
+logger.info(f"Cache miss: {len(urls_to_scrape)} jobs queued for scraping")
+
 # ─────────────────────────────────────────────────────────
 # Job detail scraping
 # ─────────────────────────────────────────────────────────
 
-job_links_list = list(all_job_links)
+job_links_list = list(urls_to_scrape)  # ← CACHE: only scrape uncached URLs
 chunk_size = max(1, len(job_links_list) // len(drivers))
 
 job_chunks = []
@@ -289,6 +322,13 @@ with tqdm(total=total_jobs, desc="Collecting Job Data", unit="job") as pbar:
                     data.append(job)
 
 logger.info(f"Total unique jobs scraped: {len(data)}")
+
+# ← CACHE: persist freshly scraped jobs, then merge with cache hits
+written = job_cache.set_batch(data)
+logger.info(f"Cache updated: {written} new entries written → {job_cache.stats()['total_entries']} total")
+
+data = data + cached_jobs  # newly scraped first, then cache hits
+logger.info(f"Total jobs after cache merge: {len(data)}")
 
 # ─────────────────────────────────────────────────────────
 # Driver cleanup
@@ -431,16 +471,22 @@ apply_results = {}
 if AUTO_APPLY and apply_driver:
     logger.info("AUTO_APPLY enabled. Starting auto-apply pipeline...")
 
-    from AutoApply.auto_apply_new import (
+    from auto_apply.auto_apply_new import (
         load_cache, load_qa, extract_skill_summary,
         apply_to_job, handle_screening,
         AppliedCache, FailedLogger,
         cache_set, PROFILE, MAX_SUCCESS,
+        set_active_profile,
     )
 
+    # ── Sync auto_apply profile to main.py run ──────────────────────────
+    _profile_key_map = {"A": "A_NEW", "B": "B_OLD", "M": "C_MAYURI"}
+    set_active_profile(_profile_key_map.get(run, "C_MAYURI"))
+    logger.info(f"Auto-apply profile set to: {_profile_key_map.get(run)}")
+
     # ── Setup shared state ──────────────────────────────────
-    qa_cache_path  = os.path.join(base_dir, "AutoApply", "qa_cache.json")
-    master_qa_path = os.path.join(base_dir, "AutoApply", "master_qa.json")
+    qa_cache_path  = os.path.join(profile_dir, "qa_cache.json")
+    master_qa_path = os.path.join(profile_dir, "master_qa.json")
 
     cache         = load_cache(qa_cache_path)
     qa            = load_qa(master_qa_path)
