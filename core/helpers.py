@@ -38,14 +38,18 @@ def collect_links_from_page(driver, page_url, job_links_xpath):
         WebDriverWait(driver, 15).until(
             EC.presence_of_all_elements_located((By.XPATH, job_links_xpath))
         )
-        
+
         links = set()
         elements = driver.find_elements(By.XPATH, job_links_xpath)
         for link in elements:
             href = link.get_attribute("href")
             if href:
-                links.add(href)
-        
+                # Normalize: strip query params and fragment so the same job
+                # URL with different tracking params doesn't count as two jobs.
+                parsed = urlparse(href)
+                clean = urlunparse(parsed._replace(query='', fragment=''))
+                links.add(clean)
+
         return links
     except Exception as e:
         return set()
@@ -78,9 +82,20 @@ def check_status(driver, wait, label_text):
 
 
 def extract_job_id(job_url: str) -> str:
-    """Extract numeric job ID from Naukri job URL."""
+    """Extract numeric job ID from Naukri job URL.
+
+    Primary:  standard format — 10+ digit ID before '?' or end of string.
+    Fallback: last numeric sequence of 6+ digits in the URL path, for
+              non-standard or shortened Naukri URLs that still contain an ID.
+    """
     match = re.search(r'-(\d{10,})(?:\?|$)', job_url)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    path = urlparse(job_url).path
+    numbers = re.findall(r'\d{6,}', path)
+    if numbers:
+        return numbers[-1]
+    return None
 
 
 def capture_all_job_apis(driver, job_id: str = None) -> dict:
@@ -153,6 +168,14 @@ def extract_job_details(driver, url):
         
         driver.get(url)
         wait = WebDriverWait(driver, 15)
+
+        # Check for expired / unavailable job page early — no point scraping further
+        try:
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+            if "job you are looking for is" in page_text.lower():
+                return None
+        except:
+            pass
 
         try:
             job_desc_element = wait.until(

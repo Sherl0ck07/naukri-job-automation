@@ -2,10 +2,11 @@
 
 import json
 import os
+import time
 import threading
 from datetime import datetime, timezone, timedelta
 
-TTL_DAYS = 30
+TTL_DAYS = 60
 
 
 class JobScrapeCache:
@@ -44,19 +45,74 @@ class JobScrapeCache:
             return job_id in self._store
 
     def get(self, job_id: str) -> dict | None:
-        """Return the cached job_data dict, or None if not found."""
+        """Return the cached job_data dict with _cached_at injected, or None."""
         with self._lock:
             entry = self._store.get(job_id)
-            return entry["job_data"] if entry else None
+            if not entry:
+                return None
+            job = dict(entry["job_data"])
+            job["_cached_at"] = entry.get("cached_at", "")
+            return job
 
     def get_batch(self, job_ids: list[str]) -> dict[str, dict]:
-        """Return {job_id: job_data} for every id that is cached."""
+        """Return {job_id: job_data} for every id that is cached, with _cached_at injected."""
         with self._lock:
-            return {
-                jid: self._store[jid]["job_data"]
-                for jid in job_ids
-                if jid in self._store
+            result = {}
+            for jid in job_ids:
+                if jid in self._store:
+                    entry = self._store[jid]
+                    job = dict(entry["job_data"])
+                    job["_cached_at"] = entry.get("cached_at", "")
+                    result[jid] = job
+            return result
+
+    def is_stale(self, job_id: str, days: int) -> bool:
+        """Return True if the cached entry is older than `days` days."""
+        with self._lock:
+            entry = self._store.get(job_id)
+            if not entry:
+                return True
+            cached_at = datetime.fromisoformat(
+                entry.get("cached_at", "1970-01-01T00:00:00+00:00")
+            )
+            return (datetime.now(timezone.utc) - cached_at) > timedelta(days=days)
+
+    def set_one(self, job: dict) -> bool:
+        """
+        Store a single job in memory without flushing to disk.
+        Call flush() periodically to persist.
+        Returns True if stored (job has a job_id), False otherwise.
+        """
+        job_id = job.get("job_id")
+        if not job_id:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._store[job_id] = {
+                "cached_at": now,
+                "job_data":  job,
             }
+        return True
+
+    def flush(self):
+        """Write current in-memory store to disk atomically."""
+        with self._lock:
+            self._save()
+
+    def start_background_flush(self, interval_seconds: int = 30):
+        """
+        Start a daemon thread that flushes to disk every interval_seconds.
+        Workers call set_one() freely; this thread handles all disk I/O.
+        Call flush() once after workers finish to capture the final state.
+        """
+        def _loop():
+            while True:
+                time.sleep(interval_seconds)
+                with self._lock:
+                    self._save()
+
+        t = threading.Thread(target=_loop, daemon=True, name="cache-flusher")
+        t.start()
 
     def set_batch(self, jobs: list[dict]) -> int:
         """

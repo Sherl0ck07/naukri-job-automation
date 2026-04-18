@@ -4,11 +4,13 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
 import sys
 import ast
 import json
 import time
+import queue
 import datetime
 import logging
 import warnings
@@ -47,6 +49,8 @@ os.makedirs(output_folder, exist_ok=True)
 
 run        = "A"
 AUTO_APPLY = True
+FREELANCE  = False   # True → detect & filter freelance jobs, score with FreelanceScorer
+RERANKER   = True    # True → cross-encoder reranks top-60 jobs_to_apply before applying
 
 # ── Per-run profile resolution ────────────────────────────────────────────
 if run == "A":
@@ -74,11 +78,16 @@ else:
     new_filename        = f"job_crawl_summary_M_{timestamp}.html"
     log_file            = os.path.join(output_folder, f"output_M_{timestamp}.log")
 
+
+
+
+
 with open(config_path, "r") as f:
     config = json.load(f)
 
 # ← CACHE: init per-profile cache (prunes expired entries on startup)
 job_cache = JobScrapeCache(profile_dir, cache_file)
+job_cache.start_background_flush(interval_seconds=30)  # writes every 30s, never blocks workers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,12 +142,14 @@ def login_driver(driver_id, username, password, logger):
 
 
 def collect_links_worker(args):
-    driver, page_urls, job_links_xpath, progress_callback, skip_patterns = args
+    driver, page_queue, job_links_xpath, progress_callback, skip_patterns = args
     all_links = set()
 
-    logger.info(f"Worker started with {len(page_urls)} pages to scrape")
-
-    for idx, page_url in enumerate(page_urls):
+    while True:
+        try:
+            page_url = page_queue.get_nowait()
+        except queue.Empty:
+            break
         links = collect_links_from_page(driver, page_url, job_links_xpath)
         all_links.update(links)
         if progress_callback:
@@ -153,13 +164,14 @@ def collect_links_worker(args):
 
 
 def scrape_jobs_worker(args):
-    driver, job_urls, progress_callback = args
+    driver, job_urls, progress_callback, job_cache = args
     jobs = []
 
     for url in job_urls:
         job_data = extract_job_details(driver, url)
         if job_data:
             jobs.append(job_data)
+            job_cache.set_one(job_data)  # in-memory only — background thread flushes
         if progress_callback:
             progress_callback()
 
@@ -241,15 +253,14 @@ for l in lk:
 
 logger.info(f"Total pagination URLs: {len(all_pagination_urls)}")
 
-chunk_size = max(1, len(all_pagination_urls) // len(drivers))
-url_chunks = []
-for i in range(len(drivers) - 1):
-    url_chunks.append(all_pagination_urls[i * chunk_size:(i + 1) * chunk_size])
-url_chunks.append(all_pagination_urls[(len(drivers) - 1) * chunk_size:])
-
 logger.info("Collecting job links in parallel...")
 
 skip_url_patterns = ["soul-ai", "benovymed"]
+
+# Shared queue — fast drivers steal work from slow ones automatically
+page_queue = queue.Queue()
+for _url in all_pagination_urls:
+    page_queue.put(_url)
 
 all_job_links = set()
 total_pages = len(all_pagination_urls)
@@ -259,9 +270,9 @@ with tqdm(total=total_pages, desc="Scraping Pages", unit="page") as pbar:
         futures = [
             executor.submit(
                 collect_links_worker,
-                (driver, chunk, job_links_xpath, lambda: pbar.update(1), skip_url_patterns)
+                (driver, page_queue, job_links_xpath, lambda: pbar.update(1), skip_url_patterns)
             )
-            for driver, chunk in zip(drivers, url_chunks)
+            for driver in drivers
         ]
 
         for future in as_completed(futures):
@@ -271,18 +282,29 @@ with tqdm(total=total_pages, desc="Scraping Pages", unit="page") as pbar:
 logger.info(f"Total unique job links collected: {len(all_job_links)}")
 
 # ← CACHE: split links into already-cached vs needs-scraping
+# skillMatch jobs older than REFRESH_AFTER_DAYS are re-scraped to refresh
+# earlyApplicant, applicants_text, and match data (these change daily).
+REFRESH_AFTER_DAYS = 3
+
 cached_jobs: list = []
 urls_to_scrape: list = []
+refreshed_count = 0
 
 for link in all_job_links:
     jid = extract_job_id(link)
     if jid and job_cache.is_cached(jid):
-        cached_jobs.append(job_cache.get(jid))
+        job_data = job_cache.get(jid)  # includes _cached_at
+        if job_data.get("skillMatch") and job_cache.is_stale(jid, REFRESH_AFTER_DAYS):
+            urls_to_scrape.append(link)
+            refreshed_count += 1
+        else:
+            cached_jobs.append(job_data)
     else:
         urls_to_scrape.append(link)
 
-logger.info(f"Cache hit:  {len(cached_jobs)} jobs loaded from cache")
-logger.info(f"Cache miss: {len(urls_to_scrape)} jobs queued for scraping")
+logger.info(f"Cache hit:     {len(cached_jobs)} jobs loaded from cache")
+logger.info(f"Cache miss:    {len(urls_to_scrape)} jobs queued for scraping")
+logger.info(f"Force-refresh: {refreshed_count} stale skillMatch jobs re-queued")
 
 # ─────────────────────────────────────────────────────────
 # Job detail scraping
@@ -305,7 +327,7 @@ total_jobs = len(job_links_list)
 with tqdm(total=total_jobs, desc="Collecting Job Data", unit="job") as pbar:
     with ThreadPoolExecutor(max_workers=len(drivers)) as executor:
         futures = [
-            executor.submit(scrape_jobs_worker, (driver, chunk, lambda: pbar.update(1)))
+            executor.submit(scrape_jobs_worker, (driver, chunk, lambda: pbar.update(1), job_cache))
             for driver, chunk in zip(drivers, job_chunks)
         ]
 
@@ -315,7 +337,6 @@ with tqdm(total=total_jobs, desc="Collecting Job Data", unit="job") as pbar:
                 key = (
                     job.get("Job Title", "").strip().lower(),
                     job.get("Company Name", "").strip().lower(),
-                    job.get("location", "").strip().lower()
                 )
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -323,12 +344,24 @@ with tqdm(total=total_jobs, desc="Collecting Job Data", unit="job") as pbar:
 
 logger.info(f"Total unique jobs scraped: {len(data)}")
 
-# ← CACHE: persist freshly scraped jobs, then merge with cache hits
-written = job_cache.set_batch(data)
-logger.info(f"Cache updated: {written} new entries written → {job_cache.stats()['total_entries']} total")
+# Final flush — captures anything the background thread hasn't written yet.
+job_cache.flush()
+logger.info(f"Cache updated: {len(data)} scraped → {job_cache.stats()['total_entries']} total entries in cache")
 
-data = data + cached_jobs  # newly scraped first, then cache hits
-logger.info(f"Total jobs after cache merge: {len(data)}")
+# Deduplicate by job_id: scraped (fresh) overwrites cached (stale).
+# Jobs without a job_id are kept as-is (safety net, should not happen).
+merged: dict = {}
+for job in cached_jobs:
+    jid = job.get("job_id")
+    if jid:
+        merged[jid] = job
+for job in data:
+    jid = job.get("job_id")
+    if jid:
+        merged[jid] = job  # fresh scrape wins
+no_id_jobs = [j for j in data if not j.get("job_id")]
+data = list(merged.values()) + no_id_jobs
+logger.info(f"Total jobs after deduplicated merge: {len(data)}")
 
 # ─────────────────────────────────────────────────────────
 # Driver cleanup
@@ -354,7 +387,7 @@ else:
 # Smart Scoring
 # ─────────────────────────────────────────────────────────
 
-logger.info("Starting smart scoring...")
+logger.info("Starting scoring...")
 
 # Build ResumeProfile from Ollama-parsed structured data
 resume_profile = ResumeProfile(
@@ -381,14 +414,36 @@ with torch.no_grad():
 # Attach embeddings so scorer can access them without re-encoding
 resume_profile.sections["_embeddings"] = resume_embeddings
 
-scorer = SmartScorer()
+# ── Freelance mode: detect + filter, then use FreelanceScorer ──────────────
+from score import precompute_resume_embeddings, precompute_job_embeddings
 
-for job in tqdm(data, desc="Scoring Jobs"):
+if FREELANCE:
+    from freelance_score import is_freelance_job, FreelanceScorer
+    before = len(data)
+    data   = [j for j in data if is_freelance_job(j)]
+    logger.info(f"Freelance filter: {len(data)}/{before} jobs detected as freelance/part-time")
+    scorer = FreelanceScorer()
+else:
+    scorer = SmartScorer()
+
+# Pre-encode resume skills + sections — runs for ALL modes (required by both scorers)
+precompute_resume_embeddings(resume_profile, model_, device)
+
+# ── Parse + batch pre-encode job embeddings (ALL modes) ────────────────────
+job_parsed_map = {}
+for idx, job in enumerate(data):
+    v3 = job.get("matchscore_api", {})
+    v4 = job.get("v4_data", {})
+    job_parsed_map[idx] = parse_job_data(job, v3, v4)
+
+parsed_list = list(job_parsed_map.values())
+precompute_job_embeddings(parsed_list, model_, device)
+logger.info(f"Job embeddings precomputed for {len(parsed_list)} jobs.")
+
+# ── Score ───────────────────────────────────────────────────────────────────
+for idx, job in enumerate(tqdm(data, desc="Scoring Jobs")):
     try:
-        v3 = job.get("matchscore_api", {})
-        v4 = job.get("v4_data", {})
-
-        job_parsed = parse_job_data(job, v3, v4)
+        job_parsed = job_parsed_map[idx]
         result     = scorer.score(resume_profile, job_parsed, model_)
 
         job["total_score"]     = result["total_score"]
@@ -407,7 +462,7 @@ for job in tqdm(data, desc="Scoring Jobs"):
         job["score"] = None
         job["total_score"] = None
 
-logger.info("Smart scoring completed.")
+logger.info("Scoring completed.")
 
 # ─────────────────────────────────────────────────────────
 # Save raw JSON
@@ -427,38 +482,56 @@ logger.info(f"Job data JSON saved at {json_path}")
 
 logger.info("Filtering jobs with skill match priority...")
 
-skill_matched_jobs = []
-other_jobs = []
+if FREELANCE:
+    # No score floor — all detected freelance jobs included.
+    # Naukri skillMatch bucket first, then by total_score desc.
+    skill_matched_jobs = []
+    other_jobs = []
+    for job in data:
+        if not isinstance(job, dict) or not isinstance(job.get("score"), (float, int)):
+            continue
+        if job.get("skillMatch"):
+            skill_matched_jobs.append(job)
+        else:
+            other_jobs.append(job)
+    skill_matched_jobs.sort(key=lambda x: x.get("total_score") or 0, reverse=True)
+    other_jobs.sort(key=lambda x: x.get("total_score") or 0, reverse=True)
+    filtered_data = skill_matched_jobs + other_jobs
+    logger.info(f"Freelance jobs in report: {len(filtered_data)} (skill-matched: {len(skill_matched_jobs)}, other: {len(other_jobs)})")
+else:
+    skill_matched_jobs = []
+    other_jobs = []
 
-for job in data:
-    if not isinstance(job, dict):
-        continue
+    for job in data:
+        if not isinstance(job, dict):
+            continue
 
-    score = job.get("score")
-    skill_match = job.get("skillMatch", False)
+        score = job.get("score")
+        skill_match = job.get("skillMatch", False)
 
-    if not isinstance(score, (float, int)) or score is None:
-        continue
+        if not isinstance(score, (float, int)) or score is None:
+            continue
 
-    if skill_match:
-        skill_matched_jobs.append(job)
-    elif score > 0.5:
-        other_jobs.append(job)
+        if skill_match:
+            skill_matched_jobs.append(job)
+        elif score > 0.5:
+            other_jobs.append(job)
 
-# Sort by total_score (richer signal), fallback to legacy score * 100
-skill_matched_jobs.sort(key=lambda x: x.get("total_score") or (x.get("score", 0) * 100), reverse=True)
-other_jobs.sort(key=lambda x: x.get("total_score") or (x.get("score", 0) * 100), reverse=True)
+    # Sort by total_score (richer signal), fallback to legacy score * 100
+    skill_matched_jobs.sort(key=lambda x: x.get("total_score") or (x.get("score", 0) * 100), reverse=True)
+    other_jobs.sort(key=lambda x: x.get("total_score") or (x.get("score", 0) * 100), reverse=True)
 
-filtered_data = skill_matched_jobs + other_jobs
+    filtered_data = skill_matched_jobs + other_jobs
 
-logger.info(f"Skill-matched jobs: {len(skill_matched_jobs)}")
-logger.info(f"Other jobs (score > 0.5): {len(other_jobs)}")
-logger.info(f"Total jobs in report: {len(filtered_data)}")
+    logger.info(f"Skill-matched jobs: {len(skill_matched_jobs)}")
+    logger.info(f"Other jobs (score > 0.5): {len(other_jobs)}")
+    logger.info(f"Total jobs in report: {len(filtered_data)}")
 
-if skill_matched_jobs:
-    logger.info(f"Skill-matched score range: {skill_matched_jobs[-1].get('total_score', 0):.1f} - {skill_matched_jobs[0].get('total_score', 0):.1f}")
-if other_jobs:
-    logger.info(f"Other jobs score range: {other_jobs[-1].get('total_score', 0):.1f} - {other_jobs[0].get('total_score', 0):.1f}")
+if not FREELANCE:
+    if skill_matched_jobs:
+        logger.info(f"Skill-matched score range: {skill_matched_jobs[-1].get('total_score', 0):.1f} - {skill_matched_jobs[0].get('total_score', 0):.1f}")
+    if other_jobs:
+        logger.info(f"Other jobs score range: {other_jobs[-1].get('total_score', 0):.1f} - {other_jobs[0].get('total_score', 0):.1f}")
 
 new_filename = os.path.join(output_folder, new_filename)
 
@@ -472,10 +545,10 @@ if AUTO_APPLY and apply_driver:
     logger.info("AUTO_APPLY enabled. Starting auto-apply pipeline...")
 
     from auto_apply.auto_apply_new import (
-        load_cache, load_qa, extract_skill_summary,
+        QAStore, extract_skill_summary,
         apply_to_job, handle_screening,
         AppliedCache, FailedLogger,
-        cache_set, PROFILE, MAX_SUCCESS,
+        PROFILE, MAX_SUCCESS,
         set_active_profile,
     )
 
@@ -485,16 +558,14 @@ if AUTO_APPLY and apply_driver:
     logger.info(f"Auto-apply profile set to: {_profile_key_map.get(run)}")
 
     # ── Setup shared state ──────────────────────────────────
-    qa_cache_path  = os.path.join(profile_dir, "qa_cache.json")
-    master_qa_path = os.path.join(profile_dir, "master_qa.json")
+    qa_store_path = os.path.join(profile_dir, "qa_store.json")
 
-    cache         = load_cache(qa_cache_path)
-    qa            = load_qa(master_qa_path)
+    qa_store      = QAStore(qa_store_path)   # auto-migrates from qa_cache + master_qa on first run
     skill_summary = extract_skill_summary(resume_text)
     applied_cache = AppliedCache()
     failed_logger = FailedLogger()
 
-    logger.info(f"QA cache: {len(cache)} entries | QA master: {len(qa)} entries | Applied: {len(applied_cache.cache)}")
+    logger.info(f"QA store: {len(qa_store.entries)} entries | Applied: {len(applied_cache.cache)}")
     logger.info(f"Skill summary: {skill_summary}")
 
     # ── Filter and deduplicate jobs ─────────────────────────
@@ -511,12 +582,21 @@ if AUTO_APPLY and apply_driver:
     best = {}
     for job in data:
         score = job.get("score") or 0
-        if score <= 0.5:
-            stats["score_filtered"] += 1
-            continue
 
+        # extApp always skipped — beyond auto-apply capabilities
         if job.get("extApp"):
             stats["extapp_filtered"] += 1
+            continue
+
+        # Full-time mode: skip low-score jobs.
+        # Freelance mode: skip only if semantic fit is near-zero (clearly unrelated domain).
+        if FREELANCE:
+            sem = job.get("score_breakdown", {}).get("semantic", 0)
+            if sem < 20:
+                stats["score_filtered"] += 1
+                continue
+        elif score <= 0.38:
+            stats["score_filtered"] += 1
             continue
 
         url = job.get("URL", "")
@@ -546,11 +626,22 @@ if AUTO_APPLY and apply_driver:
         )
     )
 
+    if RERANKER and jobs_to_apply:
+        from reranker import rerank_jobs
+        resume_summary = resume_profile.sections.get("summary", "")
+        jobs_to_apply  = rerank_jobs(
+            resume_summary = resume_summary,
+            resume_skills  = resume_profile.skills,
+            jobs           = jobs_to_apply,
+            device         = device,
+            top_n          = 60,
+        )
+
     total = len(jobs_to_apply)
 
-    logger.info("========== AUTO-APPLY FILTER FUNNEL ==========")
+    logger.info(f"========== AUTO-APPLY FILTER FUNNEL ({'FREELANCE' if FREELANCE else 'FULL-TIME'}) ==========")
     logger.info(f"Total jobs input:             {len(data)}")
-    logger.info(f"Filtered by score <=0.5:      {stats['score_filtered']}")
+    logger.info(f"{'Filtered by semantic < 20:' if FREELANCE else 'Filtered by score <=0.38:'}     {stats['score_filtered']}")
     logger.info(f"Filtered extApp=True:         {stats['extapp_filtered']}")
     logger.info(f"Filtered already applied:     {stats['already_applied']}")
     logger.info(f"Filtered by URL keywords:     {stats['url_keyword_skip']}")
@@ -598,13 +689,14 @@ if AUTO_APPLY and apply_driver:
             if status == "screening":
                 result = handle_screening(
                     apply_driver, url, resume_text, skill_summary,
-                    cache, qa, failed_logger,
+                    qa_store, failed_logger,
                 )
                 apply_results[url] = result
                 logger.info(f"  Screening result: {result}")
 
                 if result == "applied":
                     applied_cache.mark(url)
+                    qa_store.confirm_session()   # mark all answers used here as confirmed
                     success_count += 1
                     logger.info(f"  Applied [{success_count}/{MAX_SUCCESS}]")
                     if success_count >= MAX_SUCCESS:
@@ -619,7 +711,7 @@ if AUTO_APPLY and apply_driver:
             failed_logger.log(url, "exception", str(e))
             apply_results[url] = "error"
 
-    logger.info(f"Auto-apply done. Applied: {success_count} | Cache: {len(cache)} entries")
+    logger.info(f"Auto-apply done. Applied: {success_count} | QA store: {len(qa_store.entries)} entries")
 
     try:
         apply_driver.quit()

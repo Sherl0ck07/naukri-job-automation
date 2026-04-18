@@ -1,0 +1,1 @@
+huggingface-cli download BAAI/bge-reranker-base --local-dir C:\models\bge-reranker-base

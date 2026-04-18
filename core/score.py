@@ -271,12 +271,13 @@ def precompute_job_embeddings(jobs: list, model, device: str, batch_size: int = 
 class SmartScorer:
 
     WEIGHTS = {
-        "skill_match":          0.32,
-        "semantic_similarity":  0.15,
-        "naukri_v3_signals":    0.22,
+        "skill_match":          0.35,   # bidirectional — most reliable signal
+        "role_alignment":       0.20,   # NEW: job title domain vs resume domain
+        "semantic_similarity":  0.15,   # holistic JD ↔ resume fit
         "experience_fit":       0.10,
-        "location_mode":        0.08,
-        "competition_quality":  0.13,
+        "naukri_v3_signals":    0.10,   # demoted — Naukri signals unreliable
+        "competition_quality":  0.07,
+        "location_mode":        0.03,
     }
 
     SECTION_WEIGHTS = {
@@ -288,12 +289,16 @@ class SmartScorer:
         "education":      0.7,
     }
 
-    # ── FIX 2: raised threshold to reduce java/javascript false positives ──
-    SKILL_THRESHOLD = 0.82   # was 0.78
+    SKILL_THRESHOLD = 0.78   # balanced — catches semantic-close skills without Java/JS confusion
+
+    # Top-N resume skills used for reverse coverage check
+    # (skills list is ordered by prominence — first N = core domain skills)
+    REVERSE_TOP_N = 10
 
     def score(self, resume: ResumeProfile, job: dict, model=None) -> dict:
         signals = {
             "skill_match":          self._skill_match(resume, job),
+            "role_alignment":       self._role_alignment(resume, job),
             "semantic_similarity":  self._semantic(resume, job),
             "naukri_v3_signals":    self._naukri_v3(job),
             "experience_fit":       self._experience(resume, job),
@@ -315,48 +320,79 @@ class SmartScorer:
         }
 
     def _skill_match(self, resume: ResumeProfile, job: dict) -> float:
-        # ── FIX 2: embeddings ALWAYS run — naukri_ratio is a modifier only ──
         req_emb  = job.get("_req_emb")
         pref_emb = job.get("_pref_emb")
 
-        # If no embeddings available at all, fall back to naukri signal
         if req_emb is None or resume.skills_emb is None:
             naukri_ratio = job["naukri_skill_ratio"]
             return naukri_ratio if naukri_ratio is not None else 0.3
 
-        sim_matrix  = torch.nn.functional.cosine_similarity(
-            req_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1
-        )
-        req_matched = (sim_matrix.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
+        F = torch.nn.functional
 
-        pref_score = 0.0
-        if pref_emb is not None:
-            pref_matrix = torch.nn.functional.cosine_similarity(
-                pref_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1
-            )
-            pref_score = (pref_matrix.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
+        # ── Forward: fraction of job's REQUIRED skills found in resume ──────
+        sim_fwd     = F.cosine_similarity(req_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1)
+        req_matched = (sim_fwd.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
 
-        embedding_score = 0.8 * req_matched + 0.2 * pref_score
+        # ── Reverse: fraction of resume's TOP-N core skills needed by this job ──
+        # Catches domain mismatch: React resume vs Java job → reverse ≈ 0
+        core_emb     = resume.skills_emb[:self.REVERSE_TOP_N]
+        sim_rev      = F.cosine_similarity(req_emb.unsqueeze(1), core_emb.unsqueeze(0), dim=-1)
+        core_covered = (sim_rev.max(dim=0).values >= self.SKILL_THRESHOLD).float().mean().item()
 
-        # naukri_ratio: None = no signal (0 or missing), 0.7 = soft match confirmed
-        # Embedding leads, naukri_ratio is a modifier
+        # Bidirectional score: forward weighted more, reverse acts as domain gate
+        embedding_score = 0.60 * req_matched + 0.40 * core_covered
+
+        # Preferred skills: small bonus only when base score is already decent
+        # Avoids: "Java job with React preferred" inflating score
+        if pref_emb is not None and embedding_score > 0.25:
+            sim_pref   = F.cosine_similarity(pref_emb.unsqueeze(1), resume.skills_emb.unsqueeze(0), dim=-1)
+            pref_bonus = (sim_pref.max(dim=1).values >= self.SKILL_THRESHOLD).float().mean().item()
+            embedding_score = min(1.0, embedding_score + 0.08 * pref_bonus)
+
+        # naukri_ratio: soft modifier, embedding leads
         naukri_ratio = job["naukri_skill_ratio"]
-        if naukri_ratio is None:
-            combined = embedding_score                          # embedding only
-        else:
-            combined = 0.6 * embedding_score + 0.4 * naukri_ratio   # embedding leads
+        combined     = (0.65 * embedding_score + 0.35 * naukri_ratio) if naukri_ratio else embedding_score
 
-        mismatch_skills  = [s.strip() for s in job["skill_mismatch"].split(",") if s.strip()]
-        mismatch_penalty = min(0.25, len(mismatch_skills) * 0.05)
+        mismatch_skills  = [s.strip() for s in (job.get("skill_mismatch") or "").split(",") if s.strip()]
+        mismatch_penalty = min(0.20, len(mismatch_skills) * 0.04)
 
         return max(0.0, combined - mismatch_penalty)
+
+    def _role_alignment(self, resume: ResumeProfile, job: dict) -> float:
+        """
+        Cosine similarity between job's role context embedding and resume summary.
+        High when job domain matches resume target role; low when different primary domain.
+        E.g. 'Java Fullstack' vs 'React Developer resume' → low.
+        """
+        role_emb    = job.get("_role_emb")
+        section_embs = resume.section_embs
+
+        if role_emb is None or section_embs is None:
+            return 0.5
+
+        summary_emb = section_embs.get("summary")
+        skills_emb  = section_embs.get("skills")
+
+        sims = []
+        if summary_emb is not None:
+            sims.append(0.6 * torch.nn.functional.cosine_similarity(summary_emb, role_emb).item())
+        if skills_emb is not None:
+            sims.append(0.4 * torch.nn.functional.cosine_similarity(skills_emb, role_emb).item())
+
+        if not sims:
+            return 0.5
+
+        raw = sum(sims)
+        # Rescale [0.25, 0.70] → [0, 1]: below 0.25 = unrelated domain, above 0.70 = strong match
+        rescaled = (raw - 0.25) / (0.70 - 0.25)
+        return max(0.0, min(1.0, rescaled))
 
     def _semantic(self, resume: ResumeProfile, job: dict) -> float:
         jd_emb   = job.get("_jd_emb")
         role_emb = job.get("_role_emb")
 
         if jd_emb is None or resume.section_embs is None:
-            return 0.5
+            return 0.0   # no embedding = no signal, not 0.5 neutral
 
         weighted_sims, total_w = [], 0.0
 
@@ -373,13 +409,11 @@ class SmartScorer:
             return 0.0
 
         raw_sim  = sum(weighted_sims) / total_w
-        low, high = 0.30, 0.65
-        rescaled = (raw_sim - low) / (high - low)
+        # [0.25, 0.68] calibrated for JobBERT — ceiling raised to spread top-tier matches
+        rescaled = (raw_sim - 0.25) / (0.68 - 0.25)
         return max(0.0, min(1.0, rescaled))
 
     def _naukri_v3(self, job: dict) -> float:
-        # ── FIX 3: naukri_v3 uses original binary match flag, not the remapped ratio ──
-        # keyskill component: 0.7 if matched, 0 if not — no longer 0.5 neutral for no-match
         naukri_matched = job.get("_naukri_matched", False)
         keyskill_score = 0.7 if naukri_matched else 0.0
 
@@ -392,11 +426,9 @@ class SmartScorer:
         ]
         bool_score = sum(w for flag, w in booleans if flag) / 0.90
 
-        # Weight keyskill more when matched, booleans more when not
         if naukri_matched:
             return 0.50 * keyskill_score + 0.50 * bool_score
         else:
-            # No keyword match — reduce naukri_v3 weight on booleans alone
             return 0.30 * bool_score
 
     def _experience(self, resume: ResumeProfile, job: dict) -> float:
@@ -462,13 +494,15 @@ class SmartScorer:
         return min(1.0, 0.35 * freshness + 0.35 * competition + 0.25 * quality + early_bonus)
 
     def _knockouts(self, score: float, signals: dict, resume: ResumeProfile, job: dict) -> float:
-        # ── FIX 4: remove naukri_ratio==0.0 knockout (was firing on 700 jobs) ──
-        # Only penalise DOUBLE-CONFIRMED misses: embedding low AND skill_match low
-        # naukri binary flag alone is not reliable enough to trigger a knockout
-        if signals["skill_match"] < 0.15 and signals["semantic_similarity"] < 0.20:
-            score *= 0.45   # both embedding signals say no match → heavy penalty
+        # Hard domain mismatch: role doesn't align AND JD holistically doesn't fit → strong penalty
+        if signals["role_alignment"] < 0.20 and signals["semantic_similarity"] < 0.40:
+            score *= 0.35
 
-        # Experience gap knockout — unchanged
+        # Skill signal alone weak (both forward and reverse low) → moderate penalty
+        elif signals["skill_match"] < 0.15 and signals["semantic_similarity"] < 0.15:
+            score *= 0.50
+
+        # Experience gap
         min_exp = job.get("min_experience") or 0
         if min_exp and resume.total_experience_years < (min_exp - 3):
             score *= 0.65

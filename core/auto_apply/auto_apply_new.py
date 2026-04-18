@@ -288,14 +288,6 @@ def normalize_topic(q_text: str) -> str:
     return stripped[:60] if stripped else q_lower[:60]
 
 
-def topic_of(key: str) -> str:
-    parts = key.split("::", 1)
-    return parts[1] if len(parts) > 1 else key
-
-
-def cache_key(q_text: str, input_type: str) -> str:
-    return f"{input_type}::{normalize_topic(q_text)}"
-
 
 # ==========================================
 # ANSWER CLEANER
@@ -347,149 +339,266 @@ def clean_answer(raw: str) -> str:
 
 
 # ==========================================
-# CACHE  (single source of truth)
+# OPTIONS COMPATIBILITY CHECK
 # ==========================================
 
-def load_cache(path: str) -> dict:
-    p = Path(path)
-    if not p.exists() or not p.read_text().strip():
-        return {}
-    return json.loads(p.read_text())
-
-
-def cache_get(cache: dict, q_text: str, input_type: str):
-    return cache.get(cache_key(q_text, input_type))
-
-
-# FIX 4: Cross-type lookup restricted to compatible input type pairs.
-# Previously any answer could bleed across types — e.g. a radio label like
-# "Serving Notice Period" would be returned for a text field expecting "15 days".
-# Now only genuinely compatible pairs (chip↔radio, text↔text) can cross.
-_CROSS_TYPE_COMPATIBLE = {
-    ("radio",       "chip"),
-    ("chip",        "radio"),
-    ("text",        "text"),
-    ("multiselect", "multiselect"),
-    # calendar / dob are strict — never cross
-}
-
-def cache_get_by_topic(cache: dict, topic: str, input_type: str):
+def _is_answer_compatible(answer, options: list) -> bool:
     """
-    Cross-type lookup with compatibility guard.
-
-    Experience topics (exp::*) NEVER cross between text↔radio/chip because
-    numeric answers ("4") and option labels ("3-5 Years") are incompatible.
-
-    Non-experience topics only cross between known-compatible pairs.
+    Return True if a stored answer can be meaningfully mapped to the current
+    options list.  Used to skip stale cache entries when options have changed.
     """
-    is_exp = topic.startswith("exp::")
-
-    for key, val in cache.items():
-        if topic_of(key) != topic:
-            continue
-        cached_type = key.split("::", 1)[0] if "::" in key else ""
-
-        if cached_type == input_type:
-            return val  # exact type match always ok
-
-        if is_exp:
-            # Experience: no cross-type at all (numeric vs label formats clash)
-            continue
-
-        # Non-experience: only allow compatible pairs
-        if (cached_type, input_type) in _CROSS_TYPE_COMPATIBLE or \
-           (input_type, cached_type) in _CROSS_TYPE_COMPATIBLE:
-            return val
-
-    return None
-
-
-def cache_set(cache: dict, q_text: str, input_type: str, answer, path: str):
-    if answer is None or (isinstance(answer, str) and not answer.strip()):
-        return
-    key = cache_key(q_text, input_type)
-    if cache.get(key) == answer:
-        return
-    cache[key] = answer
-    Path(path).write_text(json.dumps(cache, indent=2, ensure_ascii=False))
-
-
-def cache_as_context(cache: dict) -> str:
-    if not cache:
-        return "No previous answers yet."
-    seen = {}
-    for key, val in cache.items():
-        t = topic_of(key)
-        if t not in seen:
-            seen[t] = val
-    lines = ["ANSWERS I HAVE ALREADY GIVEN — stay 100% consistent with these:"]
-    for topic, val in seen.items():
-        lines.append(f'  {topic}: "{val}"')
-    return "\n".join(lines)
+    if not options:
+        return True
+    answers = answer if isinstance(answer, list) else [str(answer)]
+    opts_lower = [o.lower() for o in options]
+    for a in answers:
+        a_lower = str(a).strip().lower()
+        if any(a_lower in o or o in a_lower for o in opts_lower):
+            return True
+        if get_close_matches(a_lower, opts_lower, n=1, cutoff=0.4):
+            return True
+        a_tokens = set(re.findall(r'\d+|\b\w{2,}\b', a_lower))
+        for opt in opts_lower:
+            if a_tokens & set(re.findall(r'\d+|\b\w{2,}\b', opt)):
+                return True
+    return False
 
 
 # ==========================================
-# QA MASTER  (human-curated answers)
+# QA STORE  (unified single source of truth)
 # ==========================================
 
-def load_qa(path: str) -> list:
-    p = Path(path)
-    if not p.exists() or not p.read_text().strip():
-        return []
-    return json.loads(p.read_text())
-
-
-def qa_as_context(qa: list) -> str:
-    if not qa:
-        return ""
-    lines = ["ADDITIONAL REFERENCE ANSWERS (human-curated):"]
-    for entry in qa:
-        q = entry.get("question", "")
-        a = entry.get("answer", "")
-        if q and a:
-            lines.append(f'  {q}: "{a}"')
-    return "\n".join(lines)
-
-
-def qa_lookup(q_text: str, qa: list):
+class QAStore:
     """
-    Match strategy (most→least strict):
-    1. Exact topic match: normalize(q_text) == normalize(entry.question)
-    2. Word-overlap ≥ 0.5 — FIX 5: gate lowered from 4 to 2 meaningful words
-       so short questions like "Open to bond?" actually match.
+    Replaces the old qa_cache.json + master_qa.json split.
+
+    Every Q&A pair is one entry:
+        {
+            "question":   "What is your current notice period?",
+            "input_type": "radio",
+            "options":    ["15 days or less", "30 days", "60 days"],
+            "answer":     "15 days or less",
+            "source":     "manual",   # "manual" | "ollama"
+            "confirmed":  true,       # true = used in a successful application
+            "use_count":  3,
+            "created_at": "2026-04-14T..."
+        }
+
+    Lookup confidence order (highest → lowest):
+        1. manual  + exact question match
+        2. manual  + fuzzy question match (word-overlap ≥ 0.55)
+        3. ollama confirmed + exact/fuzzy + options compatible
+        4. ollama unconfirmed + exact/fuzzy + options compatible
+        (miss) → caller falls through to Ollama
     """
-    q_topic = normalize_topic(q_text)
-    q_lower = q_text.lower()
-    q_words = set(re.findall(r'\b\w{3,}\b', q_lower))
 
-    best_match = None
-    best_score = 0.0
+    def __init__(self, path: str):
+        self.path = path
+        self._session_questions: list = []
+        p = Path(path)
+        if not p.exists() or not p.read_text().strip():
+            self.entries: list = []
+            self._migrate_old_files()
+        else:
+            self.entries = self._load()
 
-    for entry in qa:
-        key = entry.get("question", "").strip()
-        if not key:
-            continue
-        answer = entry.get("answer")
-        if answer is None:
-            continue
+    # ── persistence ────────────────────────────────────────────────────────
 
-        # 1. Topic equality — strongest signal
-        entry_topic = normalize_topic(key)
-        if entry_topic == q_topic:
-            return answer
+    def _load(self) -> list:
+        try:
+            return json.loads(Path(self.path).read_text(encoding="utf-8"))
+        except Exception:
+            return []
 
-        # 2. Word-overlap — FIX 5: gate lowered from 4 → 2
-        key_words = set(re.findall(r'\b\w{3,}\b', key.lower()))
-        if len(key_words) < 2:
-            continue
-        if not key_words:
-            continue
-        overlap = len(q_words & key_words) / len(key_words)
-        if overlap >= 0.5 and overlap > best_score:
-            best_score = overlap
-            best_match = answer
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.entries, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self.path)
 
-    return best_match
+    # ── one-time migration from old split files ────────────────────────────
+
+    def _migrate_old_files(self):
+        store_dir   = Path(self.path).parent
+        cache_path  = store_dir / "qa_cache.json"
+        master_path = store_dir / "master_qa.json"
+        entries: list = []
+        seen: set = set()   # question.lower() — manual added first, wins on conflict
+
+        # 1. master_qa.json → source="manual", confirmed=True
+        if master_path.exists() and master_path.read_text().strip():
+            try:
+                for item in json.loads(master_path.read_text()):
+                    q = item.get("question", "").strip()
+                    if not q or item.get("answer") is None:
+                        continue
+                    entries.append({
+                        "question":   q,
+                        "input_type": item.get("input_type", "text"),
+                        "options":    item.get("options") or [],
+                        "answer":     item.get("answer"),
+                        "source":     "manual",
+                        "confirmed":  True,
+                        "use_count":  0,
+                        "created_at": item.get("updated_at", datetime.now(timezone.utc).isoformat()),
+                    })
+                    seen.add(q.lower())
+            except Exception as exc:
+                logging.warning(f"[QAStore] master_qa migration error: {exc}")
+
+        # 2. qa_cache.json → only new rich-format entries (have a "question" key).
+        #    Old flat bare-value entries are skipped — no question text to recover.
+        if cache_path.exists() and cache_path.read_text().strip():
+            try:
+                for val in json.loads(cache_path.read_text()).values():
+                    if not isinstance(val, dict):
+                        continue
+                    q = val.get("question", "").strip()
+                    if not q or q.lower() in seen or val.get("answer") is None:
+                        continue
+                    entries.append({
+                        "question":   q,
+                        "input_type": val.get("type", "text"),
+                        "options":    val.get("options") or [],
+                        "answer":     val.get("answer"),
+                        "source":     "ollama",
+                        "confirmed":  False,
+                        "use_count":  0,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    seen.add(q.lower())
+            except Exception as exc:
+                logging.warning(f"[QAStore] qa_cache migration error: {exc}")
+
+        self.entries = entries
+        if entries:
+            self._save()
+        logging.info(f"[QAStore] Migrated {len(entries)} entries → {self.path}")
+
+    # ── public API ─────────────────────────────────────────────────────────
+
+    def lookup(self, q_text: str, input_type: str, options: list = None):
+        """
+        Returns (answer, source_label) or (None, "miss").
+        source_label: "manual" | "ollama_confirmed" | "ollama"
+        """
+        q_norm  = q_text.strip().lower()
+        q_words = set(re.findall(r'\b\w{3,}\b', q_norm))
+        best    = None   # (confidence, answer, label, entry_ref)
+
+        for entry in self.entries:
+            if entry.get("input_type") != input_type:
+                continue
+            answer = entry.get("answer")
+            if answer is None:
+                continue
+
+            eq        = entry.get("question", "").strip().lower()
+            source    = entry.get("source", "ollama")
+            confirmed = entry.get("confirmed", False)
+
+            # ── match score ───────────────────────────────────────────────
+            if eq == q_norm:
+                match_score = 1.0
+            else:
+                e_words = set(re.findall(r'\b\w{3,}\b', eq))
+                if not e_words:
+                    continue
+                overlap = len(q_words & e_words) / len(e_words)
+                if overlap < 0.55:
+                    continue
+                match_score = overlap
+
+            # ── options compatibility ─────────────────────────────────────
+            if options and not _is_answer_compatible(answer, options):
+                continue   # cached answer can't map to current options → skip
+
+            # ── confidence tier ───────────────────────────────────────────
+            if source == "manual":
+                conf, label = 3.0 + match_score, "manual"
+            elif confirmed:
+                conf, label = 2.0 + match_score, "ollama_confirmed"
+            else:
+                conf, label = 1.0 + match_score, "ollama"
+
+            if best is None or conf > best[0]:
+                best = (conf, answer, label, entry)
+
+        if best is None:
+            return None, "miss"
+
+        best[3]["use_count"] = best[3].get("use_count", 0) + 1
+        self._save()
+        return best[1], best[2]
+
+    def store(self, q_text: str, input_type: str, options, answer, source: str = "ollama"):
+        """Add or update an entry. Manual entries are never overwritten by ollama."""
+        if answer is None or (isinstance(answer, str) and not answer.strip()):
+            return
+        q_norm = q_text.strip()
+
+        for entry in self.entries:
+            if (entry.get("question", "").strip().lower() == q_norm.lower()
+                    and entry.get("input_type") == input_type):
+                if entry.get("source") == "manual" and source == "ollama":
+                    return  # never overwrite human-curated answers
+                entry["answer"]  = answer
+                entry["options"] = options if options is not None else entry.get("options", [])
+                entry["source"]  = source
+                self._save()
+                self._session_questions.append(q_norm)
+                return
+
+        self.entries.append({
+            "question":   q_norm,
+            "input_type": input_type,
+            "options":    options if options is not None else [],
+            "answer":     answer,
+            "source":     source,
+            "confirmed":  False,
+            "use_count":  0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        self._save()
+        self._session_questions.append(q_norm)
+
+    def start_session(self):
+        """Call at the start of each job's screening to track which answers were used."""
+        self._session_questions = []
+
+    def confirm_session(self):
+        """
+        Mark every question answered in this session as confirmed=True.
+        Call this only when handle_screening returns "applied".
+        """
+        q_set   = {q.lower() for q in self._session_questions}
+        changed = False
+        for entry in self.entries:
+            if (entry.get("question", "").strip().lower() in q_set
+                    and not entry.get("confirmed")):
+                entry["confirmed"] = True
+                changed = True
+        if changed:
+            self._save()
+        self._session_questions = []
+
+    def as_context(self) -> str:
+        """Format for Ollama prompt — manual + confirmed shown first, deduped by topic."""
+        if not self.entries:
+            return "No previous answers yet."
+        sorted_entries = sorted(
+            self.entries,
+            key=lambda e: (0 if e.get("source") == "manual" else
+                           1 if e.get("confirmed") else 2)
+        )
+        seen_topics: set = set()
+        lines = ["ANSWERS I HAVE ALREADY GIVEN — stay 100% consistent with these:"]
+        for entry in sorted_entries:
+            topic = normalize_topic(entry.get("question", ""))
+            if topic not in seen_topics:
+                seen_topics.add(topic)
+                lines.append(f'  {entry["question"]}: "{entry["answer"]}"')
+        return "\n".join(lines)
 
 
 # ==========================================
@@ -567,23 +676,15 @@ def ask_ollama(prompt: str) -> str:
     return response.message.content.strip()
 
 
-def build_prompt(q_text: str, cache: dict, qa: list,
+def build_prompt(q_text: str, qa_store: "QAStore",
                  skill_summary: str, resume: str,
                  options=None, is_multiselect=False) -> str:
 
-    # FIX 1: Resume text is now included in the prompt so Ollama can actually
-    # search it for skill presence. Previously `resume` was accepted but never
-    # interpolated — causing Databricks and other skills to return 0 because
-    # the model had no text to verify against.
-    # We truncate to ~3500 chars to stay within context limits while covering
-    # the full skills section + experience section of a typical resume.
     resume_snippet = resume[:3500] if resume else ""
 
     prompt = f"""You are ME filling in a job application screening form on Naukri right now.
 
-{cache_as_context(cache)}
-
-{qa_as_context(qa)}
+{qa_store.as_context()}
 
 MY RESUME (search this carefully for skill/tool presence):
 {resume_snippet}
@@ -680,68 +781,43 @@ def repair_ctc(answer: str, q_text: str) -> str:
 
 
 # ==========================================
-# RESOLVER  (4-tier: exact → cross-type → QA master → Ollama)
+# RESOLVER  (store lookup → Ollama)
 # ==========================================
 
-def resolve(q_text: str, input_type: str, cache: dict, qa: list,
+def resolve(q_text: str, input_type: str, qa_store: "QAStore",
             skill_summary: str, resume: str,
             options=None, is_multiselect=False):
 
-    topic = normalize_topic(q_text)
+    topic        = normalize_topic(q_text)
     _is_exp_text = (input_type == "text" and topic.startswith("exp::"))
 
-    # 1. Exact cache hit
-    cached = cache_get(cache, q_text, input_type)
-    if cached is not None:
-        # For text exp:: fields, reject non-numeric cached values (e.g. "Yes"
-        # from a radio answer that leaked into the cache via a previous bug).
-        if _is_exp_text and not str(cached).replace('.', '').isdigit():
+    # 1. QA store lookup (manual → confirmed ollama → unconfirmed ollama, options-validated)
+    answer, source = qa_store.lookup(q_text, input_type, options)
+
+    if answer is not None:
+        if _is_exp_text and not str(answer).replace('.', '').isdigit():
             logging.warning(
-                f"  [cache-skip] {topic} cached value '{cached}' is non-numeric "
-                f"for text field — skipping to QA/Ollama"
+                f"  [store-skip] {topic} stored value '{answer}' ({source}) "
+                f"is non-numeric for text field — falling through to Ollama"
             )
         else:
-            logging.info(f"  [cache-exact] {topic} → {str(cached)[:40]}")
-            return cached
+            logging.info(f"  [{source}] {topic} → {str(answer)[:40]}")
+            return answer
 
-    # 2. Cross-type cache hit (type-aware, compatibility-guarded)
-    cross = cache_get_by_topic(cache, topic, input_type)
-    if cross is not None:
-        if _is_exp_text and not str(cross).replace('.', '').isdigit():
-            logging.warning(
-                f"  [cache-skip] {topic} cross value '{cross}' is non-numeric "
-                f"for text field — skipping"
-            )
-        else:
-            cache_set(cache, q_text, input_type, cross, PROFILE["QA_CACHE"])
-            logging.info(f"  [cache-cross] {topic} → {str(cross)[:40]}")
-            return cross
-
-    # 3. QA master match
-    stored = qa_lookup(q_text, qa)
-    if stored is not None:
-        if _is_exp_text and not str(stored).replace('.', '').isdigit():
-            logging.warning(
-                f"  [qa-skip] {topic} QA value '{stored}' is non-numeric "
-                f"for text field — falling through to Ollama"
-            )
-        else:
-            cache_set(cache, q_text, input_type, stored, PROFILE["QA_CACHE"])
-            logging.info(f"  [qa-master] {topic} → {str(stored)[:40]}")
-            return stored
-
-    # 4. Ollama
-    prompt = build_prompt(q_text, cache, qa, skill_summary, resume, options, is_multiselect)
+    # 2. Ollama — last resort
+    prompt = build_prompt(q_text, qa_store, skill_summary, resume, options, is_multiselect)
     logging.info(f"  [ollama] {topic}")
     raw = ask_ollama(prompt)
     logging.info(f"  [ollama-raw] {raw[:80]}")
 
     if not options:
+        # Text answer: clean + CTC repair, then store immediately
         answer = repair_ctc(clean_answer(raw), q_text)
+        qa_store.store(q_text, input_type, None, answer, source="ollama")
     else:
+        # Option answer: return raw — handler does fuzzy_match then stores
         answer = raw
 
-    cache_set(cache, q_text, input_type, answer, PROFILE["QA_CACHE"])
     return answer
 
 
@@ -838,35 +914,36 @@ def fuzzy_match(answer, options: list) -> str:
 # INPUT HANDLERS
 # ==========================================
 
-def handle_radio(driver, question, cache, qa, skill_summary, resume):
+def handle_radio(driver, question, qa_store, skill_summary, resume):
     inputs  = driver.find_elements(By.CSS_SELECTOR, SELECTORS["radio_inputs"])
     options = [r.get_attribute("value") for r in inputs]
-    raw     = resolve(question, "radio", cache, qa, skill_summary, resume, options)
+    raw     = resolve(question, "radio", qa_store, skill_summary, resume, options)
     answer  = fuzzy_match(raw, options)
     radio   = driver.find_element(By.XPATH, f'//input[@value="{answer}"]')
     driver.execute_script("arguments[0].click();", radio)
     click_submit(driver)
-    cache_set(cache, question, "radio", answer, PROFILE["QA_CACHE"])
+    qa_store.store(question, "radio", options, answer)
     return answer
 
 
-def handle_text(driver, question, cache, qa, skill_summary, resume):
+def handle_text(driver, question, qa_store, skill_summary, resume):
     wait   = WebDriverWait(driver, 25)
     box    = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, SELECTORS["text_input"])))
-    answer = resolve(question, "text", cache, qa, skill_summary, resume)
+    answer = resolve(question, "text", qa_store, skill_summary, resume)
     if isinstance(answer, list):
         answer = ", ".join(str(x) for x in answer)
     driver.execute_script("arguments[0].innerText = '';", box)
     box.send_keys(str(answer))
     click_submit(driver)
-    cache_set(cache, question, "text", answer, PROFILE["QA_CACHE"])
+    # Text answers stored inside resolve() for Ollama path; store here covers store hits too
+    qa_store.store(question, "text", None, answer)
     return answer
 
 
-def handle_multiselect(driver, question, cache, qa, skill_summary, resume):
+def handle_multiselect(driver, question, qa_store, skill_summary, resume):
     inputs  = driver.find_elements(By.CSS_SELECTOR, SELECTORS["checkbox_inputs"])
     options = [i.get_attribute("value") for i in inputs]
-    raw     = resolve(question, "multiselect", cache, qa, skill_summary, resume,
+    raw     = resolve(question, "multiselect", qa_store, skill_summary, resume,
                       options, is_multiselect=True)
     if isinstance(raw, list):
         selected = [str(x) for x in raw]
@@ -884,15 +961,11 @@ def handle_multiselect(driver, question, cache, qa, skill_summary, resume):
         cb = driver.find_element(By.XPATH, f'//input[@value="{opt}"]')
         driver.execute_script("arguments[0].click();", cb)
     click_submit(driver)
-    cache_set(cache, question, "multiselect", final, PROFILE["QA_CACHE"])
+    qa_store.store(question, "multiselect", options, final)
     return final
 
 
-# FIX 2: handle_chips now always calls resolve() with the chip texts as options.
-# Previously it would skip resolve() entirely after a cache miss and just click
-# chip index 0 — answering every non-cached chip question with the first option
-# regardless of what was actually being asked.
-def handle_chips(driver, question, cache, qa, skill_summary, resume):
+def handle_chips(driver, question, qa_store, skill_summary, resume):
     chips      = driver.find_elements(By.CSS_SELECTOR, SELECTORS["chips"])
     chip_texts = [c.text.strip() for c in chips if c.text.strip()]
 
@@ -900,28 +973,24 @@ def handle_chips(driver, question, cache, qa, skill_summary, resume):
         logging.warning("[chips] No chip text found — skipping")
         return None
 
-    # Always resolve properly — resolve() handles cache hits internally
-    raw    = resolve(question, "chip", cache, qa, skill_summary, resume,
-                     options=chip_texts)
+    raw    = resolve(question, "chip", qa_store, skill_summary, resume, options=chip_texts)
     answer = fuzzy_match(str(raw), chip_texts)
 
-    # Find and click the matched chip
     for i, c in enumerate(chips):
         if c.text.strip() == answer:
             driver.execute_script("arguments[0].click();", c)
             break
     else:
-        # Fallback: click by index if text search fails (DOM timing edge case)
         idx = chip_texts.index(answer) if answer in chip_texts else 0
         driver.execute_script("arguments[0].click();", chips[idx])
         logging.warning(f"[chips] Clicked by index fallback for '{answer}'")
 
-    cache_set(cache, question, "chip", answer, PROFILE["QA_CACHE"])
+    qa_store.store(question, "chip", chip_texts, answer)
     return answer
 
 
-def handle_dob(driver, question, cache, qa, skill_summary, resume):
-    answer = resolve(question, "dob", cache, qa, skill_summary, resume)
+def handle_dob(driver, question, qa_store, skill_summary, resume):
+    answer = resolve(question, "dob", qa_store, skill_summary, resume)
     try:
         day_val, month_val, year_val = answer.split("/")
     except Exception:
@@ -948,12 +1017,12 @@ def handle_dob(driver, question, cache, qa, skill_summary, resume):
     driver.execute_script(script, day_val, month_val, year_val)
     time.sleep(2)
     click_submit(driver)
-    cache_set(cache, question, "dob", answer, PROFILE["QA_CACHE"])
+    qa_store.store(question, "dob", None, answer)
     return answer
 
 
-def handle_calendar(driver, question, cache, qa, skill_summary, resume):
-    answer = resolve(question, "calendar", cache, qa, skill_summary, resume)
+def handle_calendar(driver, question, qa_store, skill_summary, resume):
+    answer = resolve(question, "calendar", qa_store, skill_summary, resume)
     if "/" not in str(answer):
         try:
             answer = f"01/{int(str(answer).strip())}"
@@ -982,7 +1051,7 @@ def handle_calendar(driver, question, cache, qa, skill_summary, resume):
             break
     time.sleep(0.5)
     click_submit(driver)
-    cache_set(cache, question, "calendar", answer, PROFILE["QA_CACHE"])
+    qa_store.store(question, "calendar", None, answer)
     return answer
 
 
@@ -1030,10 +1099,11 @@ def wait_for_new_question(driver, last_question: str):
     return None
 
 
-def handle_screening(driver, job_url, resume_text, skill_summary, cache, qa, failed_logger):
+def handle_screening(driver, job_url, resume_text, skill_summary, qa_store, failed_logger):
     logging.info("Starting screening...")
     last_question = None
-    hkw = dict(cache=cache, qa=qa, skill_summary=skill_summary, resume=resume_text)
+    qa_store.start_session()
+    hkw = dict(qa_store=qa_store, skill_summary=skill_summary, resume=resume_text)
 
     for step in range(1, MAX_STEPS + 1):
         question = wait_for_new_question(driver, last_question)
@@ -1109,12 +1179,18 @@ class AppliedCache:
             return {}
         return {e["job_url"]: e for e in json.loads(p.read_text())}
 
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(self.cache.values()), f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
     def is_applied(self, url):
         return url in self.cache
 
     def mark(self, url):
         self.cache[url] = {"job_url": url, "applied_at": datetime.now(timezone.utc).isoformat()}
-        Path(self.path).write_text(json.dumps(list(self.cache.values()), indent=2))
+        self._save()
 
 
 # ==========================================
@@ -1127,6 +1203,12 @@ class FailedLogger:
         p = Path(self.path)
         self.cache = json.loads(p.read_text()) if p.exists() and p.read_text().strip() else []
 
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.cache, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
     def log(self, url, failure_type, msg, step=None, question=None):
         self.cache.append({
             "job_url":      url,
@@ -1136,7 +1218,7 @@ class FailedLogger:
             "step":         step,
             "question":     question,
         })
-        Path(self.path).write_text(json.dumps(self.cache, indent=2))
+        self._save()
 
 
 # ==========================================
@@ -1246,12 +1328,12 @@ if __name__ == "__main__":
     print(skill_summary)
     print("---------------------\n")
 
-    cache         = load_cache(PROFILE["QA_CACHE"])
-    qa            = load_qa(PROFILE["QA_MASTER"])
+    qa_store_path = _p(os.path.basename(os.path.dirname(PROFILE["APPLIED_LOG"])), "qa_store.json")
+    qa_store      = QAStore(qa_store_path)   # auto-migrates from qa_cache + master_qa on first run
     applied_cache = AppliedCache()
     failed_logger = FailedLogger()
 
-    logging.info(f"QA cache: {len(cache)} entries | QA master: {len(qa)} entries | Applied: {len(applied_cache.cache)}")
+    logging.info(f"QA store: {len(qa_store.entries)} entries | Applied: {len(applied_cache.cache)}")
 
     driver = create_driver()
     login(driver, PROFILE["CONFIG"])
@@ -1370,10 +1452,11 @@ if __name__ == "__main__":
             if status == "screening":
                 result = handle_screening(
                     driver, url, resume_text, skill_summary,
-                    cache, qa, failed_logger
+                    qa_store, failed_logger
                 )
                 if result == "applied":
                     applied_cache.mark(url)
+                    qa_store.confirm_session()
                     success_count += 1
                     logging.info(f"Applied [{success_count}/{MAX_SUCCESS}]")
                     if success_count >= MAX_SUCCESS:
@@ -1387,5 +1470,5 @@ if __name__ == "__main__":
             logging.error(f"Error on {url}: {e}")
             failed_logger.log(url, "exception", str(e))
 
-    logging.info(f"Done. Applied: {success_count} | Cache: {len(cache)} entries")
+    logging.info(f"Done. Applied: {success_count} | QA store: {len(qa_store.entries)} entries")
     driver.quit()
