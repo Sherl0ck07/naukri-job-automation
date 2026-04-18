@@ -9,7 +9,7 @@ resume-match/
 chrome_user_data_*/
 # Jupyter notebook junk
 *.ipynb_checkpoints/
-
+*.key
 # Browser / automation cache
 chrome_user_data/
 

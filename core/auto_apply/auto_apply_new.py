@@ -35,6 +35,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from ollama import chat
+import requests as _requests
 import PyPDF2
 
 
@@ -98,6 +99,11 @@ def set_active_profile(profile_key: str):
     PROFILE        = CONFIGS[ACTIVE_PROFILE]
     FAILED_LOG     = PROFILE["FAILED_LOG"]
 OLLAMA_MODEL    = "qwen2.5:7b"
+NEBIUS_URL      = "https://api.tokenfactory.nebius.com/v1/chat/completions"
+NEBIUS_MODEL    = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+_USE_NEBIUS     = False   # set by set_llm_backend()
+_NEBIUS_API_KEY = None    # set by set_llm_backend()
+
 MAX_STEPS       = 30
 POLL_RETRIES    = 10
 POLL_INTERVAL   = 1.0
@@ -668,12 +674,47 @@ def extract_skill_summary(resume_text: str) -> str:
 
 
 # ==========================================
-# OLLAMA
+# LLM BACKEND — Nebius (cloud) or Ollama (local)
 # ==========================================
+
+def set_llm_backend(use_nebius: bool = False, api_key: str = None):
+    """Switch LLM backend. Falls back to Ollama silently if Nebius call fails."""
+    global _USE_NEBIUS, _NEBIUS_API_KEY
+    _USE_NEBIUS     = use_nebius and bool(api_key)
+    _NEBIUS_API_KEY = api_key
+    backend = f"Nebius ({NEBIUS_MODEL})" if _USE_NEBIUS else f"Ollama ({OLLAMA_MODEL})"
+    logging.info(f"[auto_apply] LLM backend: {backend}")
+
 
 def ask_ollama(prompt: str) -> str:
     response = chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}])
     return response.message.content.strip()
+
+
+def ask_nebius(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {_NEBIUS_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model":       NEBIUS_MODEL,
+        "messages":    [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens":  500,
+    }
+    response = _requests.post(NEBIUS_URL, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
+def ask_llm(prompt: str) -> str:
+    """Route to Nebius or Ollama based on set_llm_backend() config."""
+    if _USE_NEBIUS:
+        try:
+            return ask_nebius(prompt)
+        except Exception as e:
+            logging.warning(f"[nebius] call failed ({e}) — falling back to Ollama")
+    return ask_ollama(prompt)
 
 
 def build_prompt(q_text: str, qa_store: "QAStore",
@@ -804,11 +845,12 @@ def resolve(q_text: str, input_type: str, qa_store: "QAStore",
             logging.info(f"  [{source}] {topic} → {str(answer)[:40]}")
             return answer
 
-    # 2. Ollama — last resort
+    # 2. LLM — last resort (Nebius if enabled, else Ollama)
     prompt = build_prompt(q_text, qa_store, skill_summary, resume, options, is_multiselect)
-    logging.info(f"  [ollama] {topic}")
-    raw = ask_ollama(prompt)
-    logging.info(f"  [ollama-raw] {raw[:80]}")
+    _backend = "nebius" if _USE_NEBIUS else "ollama"
+    logging.info(f"  [{_backend}] {topic}")
+    raw = ask_llm(prompt)
+    logging.info(f"  [{_backend}-raw] {raw[:80]}")
 
     if not options:
         # Text answer: clean + CTC repair, then store immediately

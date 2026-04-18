@@ -74,10 +74,10 @@ def parse_job_data(listing: dict, v3: dict, v4: dict) -> dict:
     jd = v4.get("jobDetails", {})
     ab = v4.get("ambitionBoxDetails", {})
 
-    skills_other     = [s["label"] for s in jd.get("keySkills", {}).get("other", [])]
-    skills_preferred = [s["label"] for s in jd.get("keySkills", {}).get("preferred", [])]
+    skills_other     = [s["label"] for s in (jd.get("keySkills") or {}).get("other") or []]
+    skills_preferred = [s["label"] for s in (jd.get("keySkills") or {}).get("preferred") or []]
     if not skills_other:
-        skills_other = listing.get("skills", [])
+        skills_other = listing.get("skills") or []
 
     raw_html = jd.get("description", listing.get("job_description", ""))
     jd_text  = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True) if raw_html else ""

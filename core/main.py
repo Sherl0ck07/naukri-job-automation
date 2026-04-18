@@ -51,6 +51,16 @@ run        = "A"
 AUTO_APPLY = True
 FREELANCE  = False   # True → detect & filter freelance jobs, score with FreelanceScorer
 RERANKER   = True    # True → cross-encoder reranks top-60 jobs_to_apply before applying
+NEBIUS     = True    # True → use Nebius cloud LLM instead of local Ollama
+
+# ── Nebius API key — read from oneClickShell/key.key ─────────────────────
+_nebius_key_path = os.path.join(base_dir, "key.key")
+try:
+    with open(_nebius_key_path, "r", encoding="utf-8") as _f:
+        NEBIUS_API_KEY = _f.read().strip()
+except Exception:
+    NEBIUS_API_KEY = None
+    NEBIUS = False
 
 # ── Per-run profile resolution ────────────────────────────────────────────
 if run == "A":
@@ -549,13 +559,16 @@ if AUTO_APPLY and apply_driver:
         apply_to_job, handle_screening,
         AppliedCache, FailedLogger,
         PROFILE, MAX_SUCCESS,
-        set_active_profile,
+        set_active_profile, set_llm_backend,
     )
 
     # ── Sync auto_apply profile to main.py run ──────────────────────────
     _profile_key_map = {"A": "A_NEW", "B": "B_OLD", "M": "C_MAYURI"}
     set_active_profile(_profile_key_map.get(run, "C_MAYURI"))
     logger.info(f"Auto-apply profile set to: {_profile_key_map.get(run)}")
+
+    # ── LLM backend: Nebius if key present, else Ollama ─────────────────
+    set_llm_backend(use_nebius=NEBIUS, api_key=NEBIUS_API_KEY)
 
     # ── Setup shared state ──────────────────────────────────
     qa_store_path = os.path.join(profile_dir, "qa_store.json")
